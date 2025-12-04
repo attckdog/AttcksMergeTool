@@ -20,27 +20,36 @@ if (-not (Test-Path $inputFolder)) {
 }
 
 # 2. Get files sorted alphabetically
-$files = Get-ChildItem -Path $inputFolder -Filter *.funscript | Sort-Object Name
+$allFiles = Get-ChildItem -Path $inputFolder -Filter *.funscript | Sort-Object Name
 
-if ($files.Count -eq 0) {
+if ($allFiles.Count -eq 0) {
     Write-Host "No .funscript files found in '$inputFolder'." -ForegroundColor Red
     exit
 }
 
-Write-Host "Found $($files.Count) scripts. Merging using Video Duration..." -ForegroundColor Cyan
+Write-Host "Found $($allFiles.Count) scripts. Grouping by scene..." -ForegroundColor Cyan
 
 # --- GLOBAL STORAGE ---
 $globalRootActions = New-Object System.Collections.Generic.List[PSCustomObject]
 $globalAuxAxes = @{}
 $currentOffset = 0
 
+# Keep track of files we have already merged so we don't process them twice
+$processedFiles = New-Object System.Collections.Generic.HashSet[string]
+
 # Video extensions to look for
 $videoExtensions = @(".mp4", ".mkv", ".avi", ".webm", ".m4v", ".ts")
 
 # 3. Process files
-foreach ($file in $files) {
-    Write-Host "Processing: $($file.Name)" -NoNewline
-    
+foreach ($file in $allFiles) {
+    # If we already processed this file as a "child" axis of another script, skip it
+    if ($processedFiles.Contains($file.FullName)) {
+        continue
+    }
+
+    Write-Host "Processing Scene: $($file.BaseName)" -NoNewline
+    $processedFiles.Add($file.FullName) | Out-Null
+
     try {
         # --- A. DETECT VIDEO DURATION ---
         $videoDurationMs = 0
@@ -50,94 +59,143 @@ foreach ($file in $files) {
             $testPath = Join-Path $inputFolder ($file.BaseName + $ext)
             if (Test-Path $testPath) {
                 try {
-                    # Run ffprobe to get duration in seconds
                     $durString = ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$testPath" 2>&1
-                    
                     if ($durString) {
-                        # Parse string to double, then to int milliseconds
-                        # We use InvariantCulture to ensure the dot (.) is treated as decimal separator
                         $durSec = [double]::Parse($durString.Trim(), [System.Globalization.CultureInfo]::InvariantCulture)
                         $videoDurationMs = [int]($durSec * 1000)
                         $videoFound = $true
-                        Write-Host " -> Found Video ($($videoDurationMs)ms)" -ForegroundColor Green
+                        Write-Host " -> Video: $($videoDurationMs)ms" -ForegroundColor Green -NoNewline
+                    }
+                } catch {
+                    Write-Host " -> Video Error" -ForegroundColor Red -NoNewline
+                }
+                break
+            }
+        }
+        if (-not $videoFound) { Write-Host " -> No Video" -ForegroundColor Yellow -NoNewline }
+
+        # --- B. PROCESS MAIN SCRIPT ---
+        # Helper function to process actions from a JSON object
+        function Process-ScriptContent ($jsonContent, $isMain) {
+            $localJson = $jsonContent | ConvertFrom-Json
+            $localMax = 0
+            
+            # 1. Root Actions
+            if ($localJson.actions) {
+                # If this is the main file, goes to global root. 
+                # If this is a secondary file (e.g. L1.funscript), we treat its root actions as that Axis.
+                $targetList = $globalRootActions
+                
+                if (-not $isMain) {
+                   # This part is tricky. If we are processing "Scene.L1.funscript", 
+                   # its actions are at the root, but they belong to L1.
+                   return $localJson # Return to caller to handle axis assignment
+                }
+
+                foreach ($action in $localJson.actions) {
+                    $newTime = [int]$action.at + [int]$currentOffset
+                    $targetList.Add([PSCustomObject]@{ at = $newTime; pos = $action.pos })
+                    if ($action.at -gt $localMax) { $localMax = $action.at }
+                }
+            }
+
+            # 2. Embedded Axes (The file might contain internal axes too)
+            if ($localJson.axes) {
+                foreach ($axisObj in $localJson.axes) {
+                    $axId = $axisObj.id
+                    if (-not $globalAuxAxes.ContainsKey($axId)) {
+                        $globalAuxAxes[$axId] = New-Object System.Collections.Generic.List[PSCustomObject]
+                    }
+                    foreach ($action in $axisObj.actions) {
+                        $newTime = [int]$action.at + [int]$currentOffset
+                        $globalAuxAxes[$axId].Add([PSCustomObject]@{ at = $newTime; pos = $action.pos })
+                        if ($action.at -gt $localMax) { $localMax = $action.at }
                     }
                 }
-                catch {
-                    Write-Host " -> Error reading video: $_" -ForegroundColor Red
-                }
-                break # Stop looking for extensions if we found one
             }
+            return $localMax
         }
 
-        if (-not $videoFound) {
-            Write-Host " -> No matching video found (Falling back to script actions)" -ForegroundColor Yellow
-        }
-
-        # --- B. READ SCRIPT ---
-        $jsonContent = Get-Content -LiteralPath $file.FullName | Out-String
-        $json = $jsonContent | ConvertFrom-Json
+        # Process the Main File
+        $mainContent = Get-Content -LiteralPath $file.FullName | Out-String
+        $mainJson = $mainContent | ConvertFrom-Json
+        $maxTimeInScene = 0
         
-        $maxTimeInFile = 0
-        $hasActions = $false
-
-        # --- C. PROCESS ROOT ACTIONS ---
-        if ($json.actions) {
-            $hasActions = $true
-            foreach ($action in $json.actions) {
+        # Process Main File Root Actions
+        if ($mainJson.actions) {
+            foreach ($action in $mainJson.actions) {
                 $newTime = [int]$action.at + [int]$currentOffset
-                
-                $globalRootActions.Add([PSCustomObject]@{
-                    at = $newTime
-                    pos = $action.pos
-                })
-
-                if ($action.at -gt $maxTimeInFile) { $maxTimeInFile = $action.at }
+                $globalRootActions.Add([PSCustomObject]@{ at = $newTime; pos = $action.pos })
+                if ($action.at -gt $maxTimeInScene) { $maxTimeInScene = $action.at }
             }
         }
-
-        # --- D. PROCESS AUX AXES ---
-        if ($json.axes) {
-            $hasActions = $true
-            foreach ($axisObj in $json.axes) {
-                $axisId = $axisObj.id
-                if (-not $globalAuxAxes.ContainsKey($axisId)) {
-                    $globalAuxAxes[$axisId] = New-Object System.Collections.Generic.List[PSCustomObject]
-                }
+        # Process Main File Internal Axes
+        if ($mainJson.axes) {
+            foreach ($axisObj in $mainJson.axes) {
+                $axId = $axisObj.id
+                if (-not $globalAuxAxes.ContainsKey($axId)) { $globalAuxAxes[$axId] = New-Object System.Collections.Generic.List[PSCustomObject] }
                 foreach ($action in $axisObj.actions) {
                     $newTime = [int]$action.at + [int]$currentOffset
-                    $globalAuxAxes[$axisId].Add([PSCustomObject]@{
-                        at = $newTime
-                        pos = $action.pos
-                    })
-                    if ($action.at -gt $maxTimeInFile) { $maxTimeInFile = $action.at }
+                    $globalAuxAxes[$axId].Add([PSCustomObject]@{ at = $newTime; pos = $action.pos })
+                    if ($action.at -gt $maxTimeInScene) { $maxTimeInScene = $action.at }
                 }
             }
         }
 
-        # --- E. UPDATE OFFSET ---
-        if ($hasActions) {
-            # PRIORITY 1: Use actual Video Duration if found
-            if ($videoFound -and $videoDurationMs -gt 0) {
-                $currentOffset += $videoDurationMs
-            } 
-            # PRIORITY 2: Use Metadata if available
-            elseif ($json.metadata -and $json.metadata.duration) {
-                $metaDur = [int]($json.metadata.duration * 1000)
-                if ($metaDur -gt $maxTimeInFile) {
-                    $currentOffset += $metaDur
-                } else {
-                    $currentOffset += $maxTimeInFile
+        # --- C. FIND AND PROCESS SIBLING FILES (Multi-Axis stored externally) ---
+        # Look for files named "BaseName.*.funscript"
+        $pattern = "$([regex]::Escape($file.BaseName))\.(.+)\.funscript$"
+        $siblings = Get-ChildItem -Path $inputFolder -Filter "$($file.BaseName).*.funscript"
+        
+        foreach ($sibling in $siblings) {
+            if ($sibling.FullName -ne $file.FullName -and -not $processedFiles.Contains($sibling.FullName)) {
+                # Check if it matches pattern to extract Axis Name
+                if ($sibling.Name -match $pattern) {
+                    $axisName = $matches[1] # The part between BaseName and .funscript
+                    
+                    Write-Host "`n    + Merging Axis: [$axisName]" -ForegroundColor Cyan -NoNewline
+                    
+                    # Mark as processed so we don't treat it as a new scene later
+                    $processedFiles.Add($sibling.FullName) | Out-Null
+                    
+                    $subContent = Get-Content -LiteralPath $sibling.FullName | Out-String
+                    $subJson = $subContent | ConvertFrom-Json
+                    
+                    # Create storage for this axis
+                    if (-not $globalAuxAxes.ContainsKey($axisName)) {
+                        $globalAuxAxes[$axisName] = New-Object System.Collections.Generic.List[PSCustomObject]
+                    }
+
+                    # Add actions
+                    if ($subJson.actions) {
+                        foreach ($action in $subJson.actions) {
+                            $newTime = [int]$action.at + [int]$currentOffset
+                            $globalAuxAxes[$axisName].Add([PSCustomObject]@{ at = $newTime; pos = $action.pos })
+                            # Update scene duration if this axis is longer than main
+                            if ($action.at -gt $maxTimeInScene) { $maxTimeInScene = $action.at }
+                        }
+                    }
                 }
             }
-            # PRIORITY 3: Use last action timestamp
-            else {
-                $currentOffset += $maxTimeInFile
-            }
-        } 
+        }
+
+        Write-Host "" # New line
+
+        # --- D. UPDATE OFFSET FOR NEXT SCENE ---
+        # Use Video Duration -> Metadata -> Last Action
+        if ($videoFound -and $videoDurationMs -gt 0) {
+            $currentOffset += $videoDurationMs
+        } elseif ($mainJson.metadata -and $mainJson.metadata.duration) {
+            $metaDur = [int]($mainJson.metadata.duration * 1000)
+            if ($metaDur -gt $maxTimeInScene) { $currentOffset += $metaDur } 
+            else { $currentOffset += $maxTimeInScene }
+        } else {
+            $currentOffset += $maxTimeInScene
+        }
 
     }
     catch {
-        Write-Host "`nError reading $($file.Name): $($_.Exception.Message)" -ForegroundColor Red
+        Write-Host "`nError processing $($file.Name): $($_.Exception.Message)" -ForegroundColor Red
     }
 }
 
