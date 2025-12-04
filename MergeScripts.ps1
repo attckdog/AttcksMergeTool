@@ -2,15 +2,20 @@
 param([string]$OutputName = "MergedScript")
 
 $inputFolder = ".\Input"
-# Ensure the filename ends in .funscript
 $outputFile = "$OutputName.funscript"
 
+# --- CHECK FOR FFPROBE ---
+if (-not (Get-Command "ffprobe" -ErrorAction SilentlyContinue)) {
+    Write-Host "Error: 'ffprobe' is not found in your PATH." -ForegroundColor Red
+    Write-Host "Please install FFmpeg and ensure it is added to your system environment variables."
+    exit
+}
 
 # 1. Check if Input folder exists
 if (-not (Test-Path $inputFolder)) {
     Write-Host "Folder 'Input' not found. Creating it..." -ForegroundColor Yellow
     New-Item -ItemType Directory -Path $inputFolder | Out-Null
-    Write-Host "Please put your .funscript files in the 'Input' folder and run this again."
+    Write-Host "Please put your .funscript AND matching video files in the 'Input' folder and run this again."
     exit
 }
 
@@ -22,92 +27,117 @@ if ($files.Count -eq 0) {
     exit
 }
 
-Write-Host "Found $($files.Count) files. Merging Multi-Axis (Standard)..." -ForegroundColor Cyan
+Write-Host "Found $($files.Count) scripts. Merging using Video Duration..." -ForegroundColor Cyan
 
 # --- GLOBAL STORAGE ---
-# 1. Main script actions (The "actions" at the root of the file)
 $globalRootActions = New-Object System.Collections.Generic.List[PSCustomObject]
-
-# 2. Auxiliary axes (The items inside the "axes" array, grouped by ID)
-# Key = Axis ID (e.g. "R1", "Twist"), Value = List of Actions
 $globalAuxAxes = @{}
-
 $currentOffset = 0
+
+# Video extensions to look for
+$videoExtensions = @(".mp4", ".mkv", ".avi", ".webm", ".m4v", ".ts")
 
 # 3. Process files
 foreach ($file in $files) {
-    Write-Host "Processing: $($file.Name)"
+    Write-Host "Processing: $($file.Name)" -NoNewline
     
     try {
-        # Read file safely
+        # --- A. DETECT VIDEO DURATION ---
+        $videoDurationMs = 0
+        $videoFound = $false
+
+        foreach ($ext in $videoExtensions) {
+            $testPath = Join-Path $inputFolder ($file.BaseName + $ext)
+            if (Test-Path $testPath) {
+                try {
+                    # Run ffprobe to get duration in seconds
+                    $durString = ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$testPath" 2>&1
+                    
+                    if ($durString) {
+                        # Parse string to double, then to int milliseconds
+                        # We use InvariantCulture to ensure the dot (.) is treated as decimal separator
+                        $durSec = [double]::Parse($durString.Trim(), [System.Globalization.CultureInfo]::InvariantCulture)
+                        $videoDurationMs = [int]($durSec * 1000)
+                        $videoFound = $true
+                        Write-Host " -> Found Video ($($videoDurationMs)ms)" -ForegroundColor Green
+                    }
+                }
+                catch {
+                    Write-Host " -> Error reading video: $_" -ForegroundColor Red
+                }
+                break # Stop looking for extensions if we found one
+            }
+        }
+
+        if (-not $videoFound) {
+            Write-Host " -> No matching video found (Falling back to script actions)" -ForegroundColor Yellow
+        }
+
+        # --- B. READ SCRIPT ---
         $jsonContent = Get-Content -LiteralPath $file.FullName | Out-String
         $json = $jsonContent | ConvertFrom-Json
         
-        # Track the longest duration in this specific file to update the global offset later
         $maxTimeInFile = 0
         $hasActions = $false
 
-        # --- PROCESS ROOT ACTIONS (Main Axis) ---
+        # --- C. PROCESS ROOT ACTIONS ---
         if ($json.actions) {
             $hasActions = $true
             foreach ($action in $json.actions) {
                 $newTime = [int]$action.at + [int]$currentOffset
                 
-                $newAction = [PSCustomObject]@{
+                $globalRootActions.Add([PSCustomObject]@{
                     at = $newTime
                     pos = $action.pos
-                }
-                $globalRootActions.Add($newAction)
+                })
 
                 if ($action.at -gt $maxTimeInFile) { $maxTimeInFile = $action.at }
             }
         }
 
-        # --- PROCESS AUXILIARY AXES (R1, L1, Surge, etc.) ---
+        # --- D. PROCESS AUX AXES ---
         if ($json.axes) {
             $hasActions = $true
             foreach ($axisObj in $json.axes) {
                 $axisId = $axisObj.id
-                
-                # Create storage for this Axis ID if it's new to us
                 if (-not $globalAuxAxes.ContainsKey($axisId)) {
                     $globalAuxAxes[$axisId] = New-Object System.Collections.Generic.List[PSCustomObject]
                 }
-
-                # Add actions for this specific axis
                 foreach ($action in $axisObj.actions) {
                     $newTime = [int]$action.at + [int]$currentOffset
-
-                    $newAction = [PSCustomObject]@{
+                    $globalAuxAxes[$axisId].Add([PSCustomObject]@{
                         at = $newTime
                         pos = $action.pos
-                    }
-                    $globalAuxAxes[$axisId].Add($newAction)
-
+                    })
                     if ($action.at -gt $maxTimeInFile) { $maxTimeInFile = $action.at }
                 }
             }
         }
 
-        # --- UPDATE OFFSET ---
+        # --- E. UPDATE OFFSET ---
         if ($hasActions) {
-            # If the file had metadata duration, check if it's longer than the last action
-            # (Sometimes scripts end before the video ends)
-            if ($json.metadata -and $json.metadata.duration) {
-                $metaDur = [int]($json.metadata.duration * 1000) # Convert seconds to ms
+            # PRIORITY 1: Use actual Video Duration if found
+            if ($videoFound -and $videoDurationMs -gt 0) {
+                $currentOffset += $videoDurationMs
+            } 
+            # PRIORITY 2: Use Metadata if available
+            elseif ($json.metadata -and $json.metadata.duration) {
+                $metaDur = [int]($json.metadata.duration * 1000)
                 if ($metaDur -gt $maxTimeInFile) {
-                    $maxTimeInFile = $metaDur
+                    $currentOffset += $metaDur
+                } else {
+                    $currentOffset += $maxTimeInFile
                 }
             }
-            
-            # Move the offset forward by the duration of this file
-            $currentOffset += $maxTimeInFile
-        } else {
-            Write-Host "  Warning: No actions or axes found in $($file.Name)" -ForegroundColor Yellow
-        }
+            # PRIORITY 3: Use last action timestamp
+            else {
+                $currentOffset += $maxTimeInFile
+            }
+        } 
+
     }
     catch {
-        Write-Host "Error reading $($file.Name): $($_.Exception.Message)" -ForegroundColor Red
+        Write-Host "`nError reading $($file.Name): $($_.Exception.Message)" -ForegroundColor Red
     }
 }
 
@@ -120,13 +150,11 @@ $finalObj = [Ordered]@{
     axes = @()
 }
 
-# Rebuild the "axes" array from our dictionary
 foreach ($key in $globalAuxAxes.Keys) {
-    $axisObj = [Ordered]@{
+    $finalObj.axes += [Ordered]@{
         id = $key
         actions = $globalAuxAxes[$key]
     }
-    $finalObj.axes += $axisObj
 }
 
 Write-Host "Saving to $outputFile..."
