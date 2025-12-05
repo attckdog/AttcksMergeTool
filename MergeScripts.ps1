@@ -31,8 +31,9 @@ Write-Host "Found $($allFiles.Count) scripts. Grouping by scene..." -ForegroundC
 
 # --- GLOBAL STORAGE ---
 $globalRootActions = New-Object System.Collections.Generic.List[PSCustomObject]
-$globalAuxAxes = @{}
-$currentOffset = 0
+$globalBookmarks   = New-Object System.Collections.Generic.List[PSCustomObject]
+$globalAuxAxes     = @{}
+$currentOffset     = 0
 
 # Keep track of files we have already merged so we don't process them twice
 $processedFiles = New-Object System.Collections.Generic.HashSet[string]
@@ -75,53 +76,11 @@ foreach ($file in $allFiles) {
         if (-not $videoFound) { Write-Host " -> No Video" -ForegroundColor Yellow -NoNewline }
 
         # --- B. PROCESS MAIN SCRIPT ---
-        # Helper function to process actions from a JSON object
-        function Process-ScriptContent ($jsonContent, $isMain) {
-            $localJson = $jsonContent | ConvertFrom-Json
-            $localMax = 0
-            
-            # 1. Root Actions
-            if ($localJson.actions) {
-                # If this is the main file, goes to global root. 
-                # If this is a secondary file (e.g. L1.funscript), we treat its root actions as that Axis.
-                $targetList = $globalRootActions
-                
-                if (-not $isMain) {
-                   # This part is tricky. If we are processing "Scene.L1.funscript", 
-                   # its actions are at the root, but they belong to L1.
-                   return $localJson # Return to caller to handle axis assignment
-                }
-
-                foreach ($action in $localJson.actions) {
-                    $newTime = [int]$action.at + [int]$currentOffset
-                    $targetList.Add([PSCustomObject]@{ at = $newTime; pos = $action.pos })
-                    if ($action.at -gt $localMax) { $localMax = $action.at }
-                }
-            }
-
-            # 2. Embedded Axes (The file might contain internal axes too)
-            if ($localJson.axes) {
-                foreach ($axisObj in $localJson.axes) {
-                    $axId = $axisObj.id
-                    if (-not $globalAuxAxes.ContainsKey($axId)) {
-                        $globalAuxAxes[$axId] = New-Object System.Collections.Generic.List[PSCustomObject]
-                    }
-                    foreach ($action in $axisObj.actions) {
-                        $newTime = [int]$action.at + [int]$currentOffset
-                        $globalAuxAxes[$axId].Add([PSCustomObject]@{ at = $newTime; pos = $action.pos })
-                        if ($action.at -gt $localMax) { $localMax = $action.at }
-                    }
-                }
-            }
-            return $localMax
-        }
-
-        # Process the Main File
         $mainContent = Get-Content -LiteralPath $file.FullName | Out-String
         $mainJson = $mainContent | ConvertFrom-Json
         $maxTimeInScene = 0
         
-        # Process Main File Root Actions
+        # 1. Process Root Actions
         if ($mainJson.actions) {
             foreach ($action in $mainJson.actions) {
                 $newTime = [int]$action.at + [int]$currentOffset
@@ -129,7 +88,8 @@ foreach ($file in $allFiles) {
                 if ($action.at -gt $maxTimeInScene) { $maxTimeInScene = $action.at }
             }
         }
-        # Process Main File Internal Axes
+        
+        # 2. Process Embedded Axes
         if ($mainJson.axes) {
             foreach ($axisObj in $mainJson.axes) {
                 $axId = $axisObj.id
@@ -142,36 +102,55 @@ foreach ($file in $allFiles) {
             }
         }
 
+        # 3. PROCESS CHAPTERS (BOOKMARKS)
+        # We only look for chapters in the MAIN file to avoid duplicates from sibling axes
+        $hasChapters = $false
+        if ($mainJson.bookmarks) {
+            $hasChapters = $true
+            foreach ($bk in $mainJson.bookmarks) {
+                # Some formats use 'time', some might use 'at'. Standard is 'time'.
+                $bkTimeRaw = if ($null -ne $bk.time) { $bk.time } else { $bk.at }
+                $bkTime = [int]$bkTimeRaw + [int]$currentOffset
+                
+                $globalBookmarks.Add([Ordered]@{
+                    name = $bk.name
+                    time = $bkTime
+                })
+            }
+             Write-Host " -> Chapters Imported" -ForegroundColor Magenta -NoNewline
+        }
+
+        # If no chapters found, create a default one for this video segment
+        if (-not $hasChapters) {
+            $globalBookmarks.Add([Ordered]@{
+                name = $file.BaseName
+                time = [int]$currentOffset
+            })
+             Write-Host " -> Auto-Chapter Created" -ForegroundColor DarkMagenta -NoNewline
+        }
+
         # --- C. FIND AND PROCESS SIBLING FILES (Multi-Axis stored externally) ---
-        # Look for files named "BaseName.*.funscript"
         $pattern = "$([regex]::Escape($file.BaseName))\.(.+)\.funscript$"
         $siblings = Get-ChildItem -Path $inputFolder -Filter "$($file.BaseName).*.funscript"
         
         foreach ($sibling in $siblings) {
             if ($sibling.FullName -ne $file.FullName -and -not $processedFiles.Contains($sibling.FullName)) {
-                # Check if it matches pattern to extract Axis Name
                 if ($sibling.Name -match $pattern) {
-                    $axisName = $matches[1] # The part between BaseName and .funscript
-                    
+                    $axisName = $matches[1]
                     Write-Host "`n    + Merging Axis: [$axisName]" -ForegroundColor Cyan -NoNewline
-                    
-                    # Mark as processed so we don't treat it as a new scene later
                     $processedFiles.Add($sibling.FullName) | Out-Null
                     
                     $subContent = Get-Content -LiteralPath $sibling.FullName | Out-String
                     $subJson = $subContent | ConvertFrom-Json
                     
-                    # Create storage for this axis
                     if (-not $globalAuxAxes.ContainsKey($axisName)) {
                         $globalAuxAxes[$axisName] = New-Object System.Collections.Generic.List[PSCustomObject]
                     }
 
-                    # Add actions
                     if ($subJson.actions) {
                         foreach ($action in $subJson.actions) {
                             $newTime = [int]$action.at + [int]$currentOffset
                             $globalAuxAxes[$axisName].Add([PSCustomObject]@{ at = $newTime; pos = $action.pos })
-                            # Update scene duration if this axis is longer than main
                             if ($action.at -gt $maxTimeInScene) { $maxTimeInScene = $action.at }
                         }
                     }
@@ -182,7 +161,6 @@ foreach ($file in $allFiles) {
         Write-Host "" # New line
 
         # --- D. UPDATE OFFSET FOR NEXT SCENE ---
-        # Use Video Duration -> Metadata -> Last Action
         if ($videoFound -and $videoDurationMs -gt 0) {
             $currentOffset += $videoDurationMs
         } elseif ($mainJson.metadata -and $mainJson.metadata.duration) {
@@ -205,6 +183,7 @@ $finalObj = [Ordered]@{
     inverted = $false
     range = 100
     actions = $globalRootActions
+    bookmarks = $globalBookmarks
     axes = @()
 }
 
