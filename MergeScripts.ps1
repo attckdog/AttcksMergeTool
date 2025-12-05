@@ -58,8 +58,9 @@ foreach ($file in $allFiles) {
 
         foreach ($ext in $videoExtensions) {
             $testPath = Join-Path $inputFolder ($file.BaseName + $ext)
-            if (Test-Path $testPath) {
+            if (Test-Path -LiteralPath $testPath) {
                 try {
+                    # Quotes around "$testPath" handle spaces and brackets for external commands
                     $durString = ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$testPath" 2>&1
                     if ($durString) {
                         $durSec = [double]::Parse($durString.Trim(), [System.Globalization.CultureInfo]::InvariantCulture)
@@ -103,12 +104,10 @@ foreach ($file in $allFiles) {
         }
 
         # 3. PROCESS CHAPTERS (BOOKMARKS)
-        # We only look for chapters in the MAIN file to avoid duplicates from sibling axes
         $hasChapters = $false
         if ($mainJson.bookmarks) {
             $hasChapters = $true
             foreach ($bk in $mainJson.bookmarks) {
-                # Some formats use 'time', some might use 'at'. Standard is 'time'.
                 $bkTimeRaw = if ($null -ne $bk.time) { $bk.time } else { $bk.at }
                 $bkTime = [int]$bkTimeRaw + [int]$currentOffset
                 
@@ -120,7 +119,6 @@ foreach ($file in $allFiles) {
              Write-Host " -> Chapters Imported" -ForegroundColor Magenta -NoNewline
         }
 
-        # If no chapters found, create a default one for this video segment
         if (-not $hasChapters) {
             $globalBookmarks.Add([Ordered]@{
                 name = $file.BaseName
@@ -129,7 +127,7 @@ foreach ($file in $allFiles) {
              Write-Host " -> Auto-Chapter Created" -ForegroundColor DarkMagenta -NoNewline
         }
 
-        # --- C. FIND AND PROCESS SIBLING FILES (Multi-Axis stored externally) ---
+        # --- C. FIND AND PROCESS SIBLING FILES ---
         $pattern = "$([regex]::Escape($file.BaseName))\.(.+)\.funscript$"
         $siblings = Get-ChildItem -Path $inputFolder -Filter "$($file.BaseName).*.funscript"
         
