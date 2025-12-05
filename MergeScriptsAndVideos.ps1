@@ -5,8 +5,9 @@
 $inputFolder   = ".\Input"
 $tempFolder    = ".\TempTS"
 $fileList      = "filelist.txt"
-$maxThreads    = 4  # Number of videos to encode simultaneously
-$targetRes     = "1920:1080" # Target resolution for standardization
+$maxThreads    = 4            # Number of videos to encode simultaneously
+$targetRes     = "1920:1080"  # Target resolution for standardization
+$useNvenc      = $true       # Set to $true to use NVIDIA hardware acceleration, False will use CPU Encoding
 
 # Check for FFmpeg/FFprobe availability
 if (-not (Get-Command "ffmpeg" -ErrorAction SilentlyContinue) -or -not (Get-Command "ffprobe" -ErrorAction SilentlyContinue)) {
@@ -20,6 +21,12 @@ if (-not (Get-Command "ffmpeg" -ErrorAction SilentlyContinue) -or -not (Get-Comm
 Write-Host "========================================================" -ForegroundColor Cyan
 Write-Host " Step 0: Configuration" -ForegroundColor Cyan
 Write-Host "========================================================" -ForegroundColor Cyan
+if ($useNvenc) {
+    Write-Host "NVENC (Hardware Acceleration) is ENABLED." -ForegroundColor Green
+} else {
+    Write-Host "NVENC is DISABLED (Using CPU Encoding)." -ForegroundColor Yellow
+}
+
 $OutputName = Read-Host "Enter the name for the merged file (Default: MergedScript)"
 if ([string]::IsNullOrWhiteSpace($OutputName)) { $OutputName = "MergedScript" }
 
@@ -205,13 +212,22 @@ if ($videoFiles.Count -eq 0) {
         $escapedPath = "TempTS\$tsName".Replace("'", "'\''")
         "file '$escapedPath'" | Out-File -FilePath $fileList -Append -Encoding ascii
 
-        # FFmpeg Args: Standardize resolution + Safe TS conversion
-        # We add 'scale' filter to force 1080p and black bars to prevent concat errors on mixed content
+        # Select Encoding Parameters
+        if ($useNvenc) {
+            # NVENC: Hardware accelerated, Variable Bitrate, Constant Quality 23, Preset P4 (Medium)
+            $encodingParams = @("-c:v", "h264_nvenc", "-rc", "vbr", "-cq", "23", "-preset", "p4")
+        } else {
+            # x264: CPU, CRF 23, Preset Fast
+            $encodingParams = @("-c:v", "libx264", "-crf", "23", "-preset", "fast")
+        }
+
+        # Build Full Arguments
+        # Note: We use ${targetRes} to safely delimit variable name from the colon
         $args = @(
             "-hide_banner", "-loglevel", "error",
-            "-i", $vid.FullName,
-            "-c:v", "libx264", "-crf", "23", "-preset", "fast",
-            "-vf", "scale=$targetRes:force_original_aspect_ratio=decrease,pad=$targetRes:(ow-iw)/2:(oh-ih)/2",
+            "-i", $vid.FullName
+        ) + $encodingParams + @(
+            "-vf", "scale=${targetRes}:force_original_aspect_ratio=decrease,pad=${targetRes}:(ow-iw)/2:(oh-ih)/2",
             "-c:a", "aac", "-b:a", "192k",
             "-ac", "2", "-ar", "48000",
             "-af", "aresample=async=1",
