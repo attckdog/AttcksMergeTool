@@ -5,9 +5,11 @@
 $inputFolder   = ".\Input"
 $tempFolder    = ".\TempTS"
 $fileList      = "filelist.txt"
+$metaFile      = "ffmetadata.txt"
 $maxThreads    = 4            # Number of videos to encode simultaneously
-$targetRes     = "1920:1080"  # Target resolution for standardization
-$useNvenc      = $true       # Set to $true to use NVIDIA hardware acceleration, False will use CPU Encoding
+$targetRes     = "1920:1080"  # Target resolution
+$targetFps     = 60           # Target Framerate (60 is best for scripts)
+$useNvenc      = $false       # Set to $true to use NVIDIA hardware acceleration
 
 # Check for FFmpeg/FFprobe availability
 if (-not (Get-Command "ffmpeg" -ErrorAction SilentlyContinue) -or -not (Get-Command "ffprobe" -ErrorAction SilentlyContinue)) {
@@ -22,9 +24,9 @@ Write-Host "========================================================" -Foregroun
 Write-Host " Step 0: Configuration" -ForegroundColor Cyan
 Write-Host "========================================================" -ForegroundColor Cyan
 if ($useNvenc) {
-    Write-Host "NVENC (Hardware Acceleration) is ENABLED." -ForegroundColor Green
+    Write-Host "NVENC (Full Hardware Acceleration) is ENABLED." -ForegroundColor Green
 } else {
-    Write-Host "NVENC is DISABLED (Using CPU Encoding)." -ForegroundColor Yellow
+    Write-Host "NVENC is DISABLED (Using CPU Encoding). If you have an nVidia GPU enable this by editting the script." -ForegroundColor Yellow
 }
 
 $OutputName = Read-Host "Enter the name for the merged file (Default: MergedScript)"
@@ -42,27 +44,27 @@ if (-not (Test-Path -LiteralPath $inputFolder)) {
     exit
 }
 
-# Get Files (Sorted Alphabetically to ensure sync)
+# Get Files (Sorted Alphabetically)
 $scriptFiles = Get-ChildItem -LiteralPath $inputFolder -Filter *.funscript | Sort-Object Name
 $videoFiles  = Get-ChildItem -LiteralPath $inputFolder -Filter *.mp4 | Sort-Object Name
 
 # ========================================================
-#  STEP 1: MERGE FUNSCRIPTS
+#  STEP 1: MERGE FUNSCRIPTS & PREPARE CHAPTERS
 # ========================================================
 Write-Host "`n========================================================" -ForegroundColor Cyan
 Write-Host " Step 1: Merging Funscripts" -ForegroundColor Cyan
 Write-Host "========================================================" -ForegroundColor Cyan
 
+$globalBookmarks = New-Object System.Collections.Generic.List[PSCustomObject]
+$totalDurationMs = 0
+
 if ($scriptFiles.Count -eq 0) {
     Write-Host "No .funscript files found. Skipping script merge." -ForegroundColor Yellow
 } else {
     $globalRootActions = New-Object System.Collections.Generic.List[PSCustomObject]
-    $globalBookmarks   = New-Object System.Collections.Generic.List[PSCustomObject]
     $globalAuxAxes     = @{}
     $currentOffset     = 0
     $processedFiles    = New-Object System.Collections.Generic.HashSet[string]
-    
-    # Extensions to check for duration
     $vidExts = @(".mp4", ".mkv", ".avi", ".webm", ".m4v", ".ts")
     $i = 0
 
@@ -119,7 +121,7 @@ if ($scriptFiles.Count -eq 0) {
                     }
                 }
             }
-            # Chapters
+            # Funscript Bookmarks/Chapters
             $hasChapters = $false
             if ($mainJson.bookmarks) {
                 $hasChapters = $true
@@ -169,6 +171,8 @@ if ($scriptFiles.Count -eq 0) {
             Write-Host "`nError processing $($file.Name): $($_.Exception.Message)" -ForegroundColor Red
         }
     }
+    
+    $totalDurationMs = $currentOffset
     Write-Progress -Activity "Merging Scripts" -Completed
 
     # Save Funscript
@@ -185,10 +189,46 @@ if ($scriptFiles.Count -eq 0) {
 }
 
 # ========================================================
-#  STEP 2: MERGE VIDEOS (FFMPEG - PARALLEL)
+#  STEP 2: PREPARE VIDEO CHAPTERS (SKIPS LAST)
+# ========================================================
+if ($globalBookmarks.Count -gt 0) {
+    Write-Host "Generating Video Chapters metadata..." -ForegroundColor Cyan
+    $sb = New-Object System.Text.StringBuilder
+    $sb.AppendLine(";FFMETADATA1") | Out-Null
+    $sb.AppendLine("title=$OutputName") | Out-Null
+    
+    # Sort bookmarks by time
+    $sortedBk = $globalBookmarks | Sort-Object time
+
+    # This intentionally skips the very last bookmark to avoid calculating file duration.
+    for ($k = 0; $k -lt ($sortedBk.Count - 1); $k++) {
+        $start = [int]$sortedBk[$k].time
+        
+        # Since we are skipping the last one, there is ALWAYS a "next" chapter.
+        # We simply end this chapter where the next one begins.
+        $end = [int]$sortedBk[$k+1].time
+
+        # Safety check: ensure next chapter doesn't start before this one
+        if ($end -le $start) { $end = $start + 1000 }
+
+        $sb.AppendLine("[CHAPTER]") | Out-Null
+        $sb.AppendLine("TIMEBASE=1/1000") | Out-Null
+        $sb.AppendLine("START=$start") | Out-Null
+        $sb.AppendLine("END=$end") | Out-Null
+        $sb.AppendLine("title=$($sortedBk[$k].name)") | Out-Null
+    }
+    
+    # Write UTF-8 WITHOUT BOM, FFMPEG Requirement
+    $utf8NoBom = New-Object System.Text.UTF8Encoding $false
+    $absMetaPath = Join-Path -Path $PWD -ChildPath $metaFile
+    [System.IO.File]::WriteAllText($absMetaPath, $sb.ToString(), $utf8NoBom)
+}
+
+# ========================================================
+#  STEP 3: MERGE VIDEOS (FFMPEG - PARALLEL)
 # ========================================================
 Write-Host "`n========================================================" -ForegroundColor Cyan
-Write-Host " Step 2: Merging Videos (Parallel x$maxThreads)" -ForegroundColor Cyan
+Write-Host " Step 3: Merging Videos (Parallel x$maxThreads)" -ForegroundColor Cyan
 Write-Host "========================================================" -ForegroundColor Cyan
 
 if ($videoFiles.Count -eq 0) {
@@ -207,27 +247,30 @@ if ($videoFiles.Count -eq 0) {
         $tsName = "$($vid.BaseName).ts"
         $tsPath = Join-Path $tempFolder $tsName
         
-        # Add to filelist immediately (so the list order matches input order)
-        # Escape single quotes in filename just in case
         $escapedPath = "TempTS\$tsName".Replace("'", "'\''")
         "file '$escapedPath'" | Out-File -FilePath $fileList -Append -Encoding ascii
 
-        # Select Encoding Parameters
+       # Select Encoding Parameters
         if ($useNvenc) {
-            # NVENC: Hardware accelerated, Variable Bitrate, Constant Quality 23, Preset P4 (Medium)
+            # Full Hardware Acceleration (Decode + Encode)
+            # We use a Hybrid approach (GPU Decode -> CPU Filters -> GPU Encode) 
+            # This ensures the 'pad' filter works correctly without complex VRAM management
+            $inputParams    = @("-hwaccel", "cuda")
             $encodingParams = @("-c:v", "h264_nvenc", "-rc", "vbr", "-cq", "23", "-preset", "p4")
+            $videoFilter    = "scale=${targetRes}:force_original_aspect_ratio=decrease,pad=${targetRes}:(ow-iw)/2:(oh-ih)/2"
         } else {
-            # x264: CPU, CRF 23, Preset Fast
+            # CPU Encoding
+            $inputParams    = @()
             $encodingParams = @("-c:v", "libx264", "-crf", "23", "-preset", "fast")
+            $videoFilter    = "scale=${targetRes}:force_original_aspect_ratio=decrease,pad=${targetRes}:(ow-iw)/2:(oh-ih)/2"
         }
 
         # Build Full Arguments
-        # Note: We use ${targetRes} to safely delimit variable name from the colon
-        $args = @(
-            "-hide_banner", "-loglevel", "error",
+        $args = @("-hide_banner", "-loglevel", "error") + $inputParams + @(
             "-i", $vid.FullName
         ) + $encodingParams + @(
-            "-vf", "scale=${targetRes}:force_original_aspect_ratio=decrease,pad=${targetRes}:(ow-iw)/2:(oh-ih)/2",
+            "-vf", $videoFilter,
+            "-r", $targetFps,
             "-c:a", "aac", "-b:a", "192k",
             "-ac", "2", "-ar", "48000",
             "-af", "aresample=async=1",
@@ -238,7 +281,7 @@ if ($videoFiles.Count -eq 0) {
             $tsPath
         )
 
-        # Wait if we hit max threads
+        # Queue Job
         while ($runningJobs.Count -ge $maxThreads) {
             $finished = $runningJobs | Where-Object { $_.HasExited }
             foreach ($job in $finished) {
@@ -250,12 +293,11 @@ if ($videoFiles.Count -eq 0) {
             Start-Sleep -Milliseconds 200
         }
 
-        # Start Process
         Write-Host "Queueing: $($vid.Name)"
         $runningJobs += Start-Process -FilePath "ffmpeg" -ArgumentList $args -NoNewWindow -PassThru
     }
 
-    # Wait for remaining jobs
+    # Wait for completion
     while ($runningJobs.Count -gt 0) {
         $finished = $runningJobs | Where-Object { $_.HasExited }
         foreach ($job in $finished) {
@@ -268,20 +310,30 @@ if ($videoFiles.Count -eq 0) {
     }
     Write-Progress -Activity "Encoding Videos" -Completed
 
-    # 3. Concatenate
+    # 3. Concatenate and Inject Chapters
     if (Test-Path -LiteralPath $fileList) {
-        Write-Host "Concatenating files..."
+        Write-Host "Concatenating files and embedding chapters..."
+        
         $concatArgs = @(
             "-hide_banner",
             "-f", "concat",
             "-safe", "0",
-            "-i", $fileList,
+            "-i", $fileList
+        )
+
+        # Inject Metadata if exists
+        if (Test-Path -LiteralPath $metaFile) {
+            $concatArgs += @("-i", $metaFile, "-map_metadata", "1")
+        }
+
+        $concatArgs += @(
             "-c", "copy",
             "-bsf:a", "aac_adtstoasc",
             "-movflags", "+faststart",
             "-y",
             $outputVideo
         )
+
         Start-Process -FilePath "ffmpeg" -ArgumentList $concatArgs -Wait -NoNewWindow
         
         Write-Host "Video merge complete! Output: $outputVideo" -ForegroundColor Green
@@ -289,6 +341,7 @@ if ($videoFiles.Count -eq 0) {
         # Cleanup
         Remove-Item -LiteralPath $tempFolder -Recurse -Force
         Remove-Item -LiteralPath $fileList -Force
+        if (Test-Path -LiteralPath $metaFile) { Remove-Item -LiteralPath $metaFile -Force }
     } else {
         Write-Host "No files were successfully processed." -ForegroundColor Red
     }
