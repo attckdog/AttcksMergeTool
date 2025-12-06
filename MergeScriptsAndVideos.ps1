@@ -6,7 +6,7 @@ $inputFolder   = ".\Input"
 $tempFolder    = ".\TempTS"
 $fileList      = "filelist.txt"
 $metaFile      = "ffmetadata.txt"
-$maxThreads    = 4            # Number of videos to encode simultaneously
+$maxThreads    = 1            # Number of videos to encode simultaneously
 $targetRes     = "1920:1080"  # Target resolution
 $targetFps     = 60           # Target Framerate (60 is best for scripts)
 $useNvenc      = $false       # Set to $true to use NVIDIA hardware acceleration
@@ -49,7 +49,7 @@ $scriptFiles = Get-ChildItem -LiteralPath $inputFolder -Filter *.funscript | Sor
 $videoFiles  = Get-ChildItem -LiteralPath $inputFolder -Filter *.mp4 | Sort-Object Name
 
 # ========================================================
-#  STEP 1: MERGE FUNSCRIPTS & PREPARE CHAPTERS
+#  STEP 1: MERGE FUNSCRIPTS & COLLECT METADATA
 # ========================================================
 Write-Host "`n========================================================" -ForegroundColor Cyan
 Write-Host " Step 1: Merging Funscripts" -ForegroundColor Cyan
@@ -57,6 +57,15 @@ Write-Host "========================================================" -Foregroun
 
 $globalBookmarks = New-Object System.Collections.Generic.List[PSCustomObject]
 $totalDurationMs = 0
+
+# --- Metadata Collectors ---
+$metaCreators   = New-Object System.Collections.Generic.HashSet[string]
+$metaTags       = New-Object System.Collections.Generic.HashSet[string]
+$metaPerformers = New-Object System.Collections.Generic.HashSet[string]
+$metaLicenses   = New-Object System.Collections.Generic.HashSet[string]
+$metaDesc       = New-Object System.Collections.Generic.List[string]
+$metaNotes      = New-Object System.Collections.Generic.List[string]
+$metaType       = "basic" 
 
 if ($scriptFiles.Count -eq 0) {
     Write-Host "No .funscript files found. Skipping script merge." -ForegroundColor Yellow
@@ -101,6 +110,16 @@ if ($scriptFiles.Count -eq 0) {
             $mainJson = $mainContent | ConvertFrom-Json
             $maxTimeInScene = 0
             
+            # --- METADATA SCRAPING ---
+            if ($mainJson.metadata) {
+                if ($mainJson.metadata.creator) { $metaCreators.Add($mainJson.metadata.creator) | Out-Null }
+                if ($mainJson.metadata.license) { $metaLicenses.Add($mainJson.metadata.license) | Out-Null }
+                if ($mainJson.metadata.tags) { foreach ($t in $mainJson.metadata.tags) { $metaTags.Add($t) | Out-Null } }
+                if ($mainJson.metadata.performers) { foreach ($p in $mainJson.metadata.performers) { $metaPerformers.Add($p) | Out-Null } }
+                if ($mainJson.metadata.description) { $metaDesc.Add("[$($file.BaseName)]: $($mainJson.metadata.description)") }
+                if ($mainJson.metadata.notes) { $metaNotes.Add("[$($file.BaseName)]: $($mainJson.metadata.notes)") }
+            }
+
             # Root Actions
             if ($mainJson.actions) {
                 foreach ($action in $mainJson.actions) {
@@ -111,6 +130,7 @@ if ($scriptFiles.Count -eq 0) {
             }
             # Embedded Axes
             if ($mainJson.axes) {
+                $metaType = "multiaxis" 
                 foreach ($axisObj in $mainJson.axes) {
                     $axId = $axisObj.id
                     if (-not $globalAuxAxes.ContainsKey($axId)) { $globalAuxAxes[$axId] = New-Object System.Collections.Generic.List[PSCustomObject] }
@@ -121,19 +141,23 @@ if ($scriptFiles.Count -eq 0) {
                     }
                 }
             }
-            # Funscript Bookmarks/Chapters
-            $hasChapters = $false
+            
+            # --- CHAPTERS ---
+            # 1. ALWAYS add the Filename as a main chapter for this video
+            $globalBookmarks.Add([Ordered]@{ name = $file.BaseName; time = [int]$currentOffset })
+            
+            # 2. Add internal bookmarks (if any)
             if ($mainJson.bookmarks) {
-                $hasChapters = $true
                 foreach ($bk in $mainJson.bookmarks) {
                     $bkTimeRaw = if ($null -ne $bk.time) { $bk.time } else { $bk.at }
+                    # Avoid adding duplicates if internal bookmark is at 0ms and named the same
+                    if ($bkTimeRaw -eq 0 -and $bk.name -eq $file.BaseName) { continue }
+                    
                     $globalBookmarks.Add([Ordered]@{ name = $bk.name; time = ([int]$bkTimeRaw + [int]$currentOffset) })
                 }
-                Write-Host " -> Chapters Imported" -ForegroundColor Magenta -NoNewline
-            }
-            if (-not $hasChapters) {
-                $globalBookmarks.Add([Ordered]@{ name = $file.BaseName; time = [int]$currentOffset })
-                Write-Host " -> Auto-Chapter Created" -ForegroundColor DarkMagenta -NoNewline
+                Write-Host " -> Chapters Merged" -ForegroundColor Magenta -NoNewline
+            } else {
+                Write-Host " -> Main Chapter Added" -ForegroundColor DarkMagenta -NoNewline
             }
 
             # C. Process Sibling Files
@@ -144,6 +168,7 @@ if ($scriptFiles.Count -eq 0) {
                     if ($sibling.Name -match $pattern) {
                         $axisName = $matches[1]
                         Write-Host "`n    + Merging Axis: [$axisName]" -ForegroundColor Cyan -NoNewline
+                        $metaType = "multiaxis"
                         $processedFiles.Add($sibling.FullName) | Out-Null
                         $subJson = Get-Content -LiteralPath $sibling.FullName | Out-String | ConvertFrom-Json
                         
@@ -175,10 +200,31 @@ if ($scriptFiles.Count -eq 0) {
     $totalDurationMs = $currentOffset
     Write-Progress -Activity "Merging Scripts" -Completed
 
-    # Save Funscript
+    # --- BUILD FINAL METADATA OBJECT ---
+    $finalMeta = [Ordered]@{
+        bookmarks   = $globalBookmarks
+        chapters    = $globalBookmarks
+        creator     = ($metaCreators -join " + ")
+        description = ($metaDesc -join "`n")
+        duration    = [int]($totalDurationMs / 1000)
+        license     = ($metaLicenses -join ", ")
+        notes       = ($metaNotes -join "`n")
+        performers  = $metaPerformers
+        script_url  = ""
+        tags        = $metaTags
+        title       = $OutputName
+        type        = $metaType
+        video_url   = ""
+    }
+
     $finalObj = [Ordered]@{
-        version = "1.0"; inverted = $false; range = 100
-        actions = $globalRootActions; bookmarks = $globalBookmarks; axes = @()
+        version = "1.0"
+        inverted = $false
+        range = 100
+        metadata = $finalMeta
+        actions = $globalRootActions
+        bookmarks = $globalBookmarks 
+        axes = @()
     }
     foreach ($key in $globalAuxAxes.Keys) {
         $finalObj.axes += [Ordered]@{ id = $key; actions = $globalAuxAxes[$key] }
@@ -189,7 +235,7 @@ if ($scriptFiles.Count -eq 0) {
 }
 
 # ========================================================
-#  STEP 2: PREPARE VIDEO CHAPTERS (SKIPS LAST)
+#  STEP 2: PREPARE VIDEO CHAPTERS
 # ========================================================
 if ($globalBookmarks.Count -gt 0) {
     Write-Host "Generating Video Chapters metadata..." -ForegroundColor Cyan
@@ -200,15 +246,19 @@ if ($globalBookmarks.Count -gt 0) {
     # Sort bookmarks by time
     $sortedBk = $globalBookmarks | Sort-Object time
 
-    # This intentionally skips the very last bookmark to avoid calculating file duration.
+    # Loop to (Count - 1) skips the calculation for the final chapter
     for ($k = 0; $k -lt ($sortedBk.Count - 1); $k++) {
         $start = [int]$sortedBk[$k].time
-        
-        # Since we are skipping the last one, there is ALWAYS a "next" chapter.
-        # We simply end this chapter where the next one begins.
-        $end = [int]$sortedBk[$k+1].time
+        $end   = [int]$sortedBk[$k+1].time
 
-        # Safety check: ensure next chapter doesn't start before this one
+        # CLEANUP: If Start == End, it means we have two bookmarks at the exact same spot.
+        # This creates a 0ms chapter which is useless. 
+        # We skip this entry so the NEXT bookmark takes over from the same start time.
+        if ($end -eq $start) { 
+            continue 
+        }
+
+        # Safety: Ensure End > Start (e.g. if bookmarks were out of order)
         if ($end -le $start) { $end = $start + 1000 }
 
         $sb.AppendLine("[CHAPTER]") | Out-Null
@@ -218,7 +268,6 @@ if ($globalBookmarks.Count -gt 0) {
         $sb.AppendLine("title=$($sortedBk[$k].name)") | Out-Null
     }
     
-    # Write UTF-8 WITHOUT BOM, FFMPEG Requirement
     $utf8NoBom = New-Object System.Text.UTF8Encoding $false
     $absMetaPath = Join-Path -Path $PWD -ChildPath $metaFile
     [System.IO.File]::WriteAllText($absMetaPath, $sb.ToString(), $utf8NoBom)
