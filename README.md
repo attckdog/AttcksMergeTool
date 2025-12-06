@@ -1,7 +1,7 @@
-I wanted to share my merge scripts, these will eventually be converted into a proper application with a GUI. However for now this might be useful to someone. Let me know if run have any problems.
+I wanted to share my merge scripts, these will eventually be converted into a proper application with a GUI. However for now this might be useful to someone. Let me know if you have any problems.
 
 ## How To Install:
-Note: This is a windows batch file and PowerShell Script. I'd expect it Only work on modern windows systems.
+Note: This is a PowerShell Script. I'd expect it Only work on modern windows systems.
 1. Install ffmpeg, Open command prompt and run this command
  ```
 winget install Gyan.FFmpeg
