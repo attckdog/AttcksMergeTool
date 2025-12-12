@@ -1,7 +1,7 @@
 I wanted to share my merge scripts, these will eventually be converted into a proper application with a GUI. However for now this might be useful to someone. Let me know if you have any problems.
 
 ## How To Install:
-Note: This is a PowerShell Script. I'd expect it Only work on modern windows systems.
+Note: This is a windows PowerShell Script. I'd expect it Only work on modern windows systems.
 1. Install ffmpeg, Open command prompt and run this command
  ```
 winget install Gyan.FFmpeg
@@ -34,9 +34,10 @@ I'll update this post when I have the real app working.
   - Updated to handle separate files for the different axis. IE; .roll.funscript 
   - Fixed a problem with desync caused by video and script length not being the same.
 - 2025-12-06
-  - Combined everything into 1 powershell script.
+  - combined everything into 1 powershell script.
   - Added support NVEC encoding 
   - Added chapter/bookmark support
   - Added retaining of source funscript metadata where possible
   - Added video chapter support but it's kind of buggy
   - Added loading bar for the encoding.
+  - Added config in the script for resulting resolution, no up-scaling is done, Default: 1080p
