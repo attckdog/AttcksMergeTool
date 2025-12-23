@@ -9,7 +9,7 @@ $metaFile      = "ffmetadata.txt"
 $maxThreads    = 1            # Number of videos to encode simultaneously
 $targetRes     = "1920:1080"  # Target resolution
 $targetFps     = 60           # Target Framerate (60 is best for scripts)
-$useNvenc      = $false       # Set to $true to use NVIDIA hardware acceleration
+$useNvenc      = $true        # Set to $true to use NVIDIA hardware acceleration
 
 # Check for FFmpeg/FFprobe availability
 if (-not (Get-Command "ffmpeg" -ErrorAction SilentlyContinue) -or -not (Get-Command "ffprobe" -ErrorAction SilentlyContinue)) {
@@ -143,16 +143,12 @@ if ($scriptFiles.Count -eq 0) {
             }
             
             # --- CHAPTERS ---
-            # 1. ALWAYS add the Filename as a main chapter for this video
             $globalBookmarks.Add([Ordered]@{ name = $file.BaseName; time = [int]$currentOffset })
             
-            # 2. Add internal bookmarks (if any)
             if ($mainJson.bookmarks) {
                 foreach ($bk in $mainJson.bookmarks) {
                     $bkTimeRaw = if ($null -ne $bk.time) { $bk.time } else { $bk.at }
-                    # Avoid adding duplicates if internal bookmark is at 0ms and named the same
                     if ($bkTimeRaw -eq 0 -and $bk.name -eq $file.BaseName) { continue }
-                    
                     $globalBookmarks.Add([Ordered]@{ name = $bk.name; time = ([int]$bkTimeRaw + [int]$currentOffset) })
                 }
                 Write-Host " -> Chapters Merged" -ForegroundColor Magenta -NoNewline
@@ -243,22 +239,13 @@ if ($globalBookmarks.Count -gt 0) {
     $sb.AppendLine(";FFMETADATA1") | Out-Null
     $sb.AppendLine("title=$OutputName") | Out-Null
     
-    # Sort bookmarks by time
     $sortedBk = $globalBookmarks | Sort-Object time
 
-    # Loop to (Count - 1) skips the calculation for the final chapter
     for ($k = 0; $k -lt ($sortedBk.Count - 1); $k++) {
         $start = [int]$sortedBk[$k].time
         $end   = [int]$sortedBk[$k+1].time
 
-        # CLEANUP: If Start == End, it means we have two bookmarks at the exact same spot.
-        # This creates a 0ms chapter which is useless. 
-        # We skip this entry so the NEXT bookmark takes over from the same start time.
-        if ($end -eq $start) { 
-            continue 
-        }
-
-        # Safety: Ensure End > Start (e.g. if bookmarks were out of order)
+        if ($end -eq $start) { continue }
         if ($end -le $start) { $end = $start + 1000 }
 
         $sb.AppendLine("[CHAPTER]") | Out-Null
@@ -291,32 +278,33 @@ if ($videoFiles.Count -eq 0) {
     $runningJobs = @()
     $total = $videoFiles.Count
     $completed = 0
+    $jobIndex = 0
 
     foreach ($vid in $videoFiles) {
-        $tsName = "$($vid.BaseName).ts"
-        $tsPath = Join-Path $tempFolder $tsName
+        # Safe sequential name for temp files
+        $safeName = "{0:D4}.ts" -f $jobIndex
+        $tsPath = Join-Path $tempFolder $safeName
+        $jobIndex++
         
-        $escapedPath = "TempTS\$tsName".Replace("'", "'\''")
-        "file '$escapedPath'" | Out-File -FilePath $fileList -Append -Encoding ascii
+        # Use Forward Slashes for FFmpeg concat list
+        $listPath = "TempTS/$safeName" 
+        "file '$listPath'" | Out-File -FilePath $fileList -Append -Encoding ascii
 
        # Select Encoding Parameters
         if ($useNvenc) {
-            # Full Hardware Acceleration (Decode + Encode)
-            # We use a Hybrid approach (GPU Decode -> CPU Filters -> GPU Encode) 
-            # This ensures the 'pad' filter works correctly without complex VRAM management
             $inputParams    = @("-hwaccel", "cuda")
             $encodingParams = @("-c:v", "h264_nvenc", "-rc", "vbr", "-cq", "23", "-preset", "p4")
             $videoFilter    = "scale=${targetRes}:force_original_aspect_ratio=decrease,pad=${targetRes}:(ow-iw)/2:(oh-ih)/2"
         } else {
-            # CPU Encoding
             $inputParams    = @()
             $encodingParams = @("-c:v", "libx264", "-crf", "23", "-preset", "fast")
             $videoFilter    = "scale=${targetRes}:force_original_aspect_ratio=decrease,pad=${targetRes}:(ow-iw)/2:(oh-ih)/2"
         }
 
-        # Build Full Arguments
-        $args = @("-hide_banner", "-loglevel", "error") + $inputParams + @(
-            "-i", $vid.FullName
+        # Build Full Arguments with EXPLICIT QUOTING
+        # We wrap the input filename in "`" string chars so PowerShell passes quotes to FFmpeg
+        $argsList = @("-hide_banner", "-loglevel", "error") + $inputParams + @(
+            "-i", "`"$($vid.FullName)`""
         ) + $encodingParams + @(
             "-vf", $videoFilter,
             "-r", $targetFps,
@@ -343,7 +331,7 @@ if ($videoFiles.Count -eq 0) {
         }
 
         Write-Host "Queueing: $($vid.Name)"
-        $runningJobs += Start-Process -FilePath "ffmpeg" -ArgumentList $args -NoNewWindow -PassThru
+        $runningJobs += Start-Process -FilePath "ffmpeg" -ArgumentList $argsList -NoNewWindow -PassThru
     }
 
     # Wait for completion
@@ -372,7 +360,7 @@ if ($videoFiles.Count -eq 0) {
 
         # Inject Metadata if exists
         if (Test-Path -LiteralPath $metaFile) {
-            $concatArgs += @("-i", $metaFile, "-map_metadata", "1")
+            $concatArgs += @("-i", "`"$metaFile`"", "-map_metadata", "1")
         }
 
         $concatArgs += @(
@@ -380,7 +368,7 @@ if ($videoFiles.Count -eq 0) {
             "-bsf:a", "aac_adtstoasc",
             "-movflags", "+faststart",
             "-y",
-            $outputVideo
+            "`"$outputVideo`""
         )
 
         Start-Process -FilePath "ffmpeg" -ArgumentList $concatArgs -Wait -NoNewWindow
