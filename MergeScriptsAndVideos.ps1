@@ -6,10 +6,11 @@ $inputFolder   = ".\Input"
 $tempFolder    = ".\TempTS"
 $fileList      = "filelist.txt"
 $metaFile      = "ffmetadata.txt"
-$maxThreads    = 1            # Number of videos to encode simultaneously
-$targetRes     = "1920:1080"  # Target resolution
-$targetFps     = 60           # Target Framerate (60 is best for scripts)
+$maxThreads    = 1            
+$targetRes     = "1920:1080"  
+$targetFps     = 60           
 $useNvenc      = $true        # Set to $true to use NVIDIA hardware acceleration
+$useAv1        = $true       # Set to $true to use AV1 (Requires RTX 40-series for NVENC)
 
 # Check for FFmpeg/FFprobe availability
 if (-not (Get-Command "ffmpeg" -ErrorAction SilentlyContinue) -or -not (Get-Command "ffprobe" -ErrorAction SilentlyContinue)) {
@@ -26,7 +27,7 @@ Write-Host "========================================================" -Foregroun
 if ($useNvenc) {
     Write-Host "NVENC (Full Hardware Acceleration) is ENABLED." -ForegroundColor Green
 } else {
-    Write-Host "NVENC is DISABLED (Using CPU Encoding). If you have an nVidia GPU enable this by editting the script." -ForegroundColor Yellow
+    Write-Host "NVENC is DISABLED (Using CPU Encoding).  If you have an nVidia GPU enable this by editting the script." -ForegroundColor Yellow
 }
 
 $OutputName = Read-Host "Enter the name for the merged file (Default: MergedScript)"
@@ -281,28 +282,51 @@ if ($videoFiles.Count -eq 0) {
     $jobIndex = 0
 
     foreach ($vid in $videoFiles) {
-        # Safe sequential name for temp files
-        $safeName = "{0:D4}.ts" -f $jobIndex
-        $tsPath = Join-Path $tempFolder $safeName
         $jobIndex++
+
+        # --- CODEC SELECTION LOGIC ---
+        if ($useAv1) {
+            # AV1 requires MKV container for intermediate steps (TS is unstable for AV1)
+            $safeName = "{0:D4}.mkv" -f $jobIndex
+            $tempFormat = "matroska"
+            # AV1 doesn't use the h264 bitstream filter
+            $bsfFilter = @() 
+
+            if ($useNvenc) {
+                # RTX 40-Series Required for av1_nvenc
+                $inputParams    = @("-hwaccel", "cuda")
+                $encodingParams = @("-c:v", "av1_nvenc", "-rc", "vbr", "-cq", "30", "-preset", "p4")
+            } else {
+                # CPU Encoding (SVT-AV1). Preset 8 is a good speed/quality balance.
+                $inputParams    = @()
+                $encodingParams = @("-c:v", "libsvtav1", "-crf", "30", "-preset", "8")
+            }
+        } else {
+            # H.264 (Standard) - Uses .ts (MPEG-TS)
+            $safeName = "{0:D4}.ts" -f $jobIndex
+            $tempFormat = "mpegts"
+            $bsfFilter = @("-bsf:v", "h264_mp4toannexb")
+
+            if ($useNvenc) {
+                $inputParams    = @("-hwaccel", "cuda")
+                $encodingParams = @("-c:v", "h264_nvenc", "-rc", "vbr", "-cq", "23", "-preset", "p4")
+            } else {
+                $inputParams    = @()
+                $encodingParams = @("-c:v", "libx264", "-crf", "23", "-preset", "fast")
+            }
+        }
+
+        # Safe sequential path
+        $tsPath = Join-Path $tempFolder $safeName
         
-        # Use Forward Slashes for FFmpeg concat list
+        # Add to concat list (Forward slashes required by FFmpeg)
         $listPath = "TempTS/$safeName" 
         "file '$listPath'" | Out-File -FilePath $fileList -Append -Encoding ascii
 
-       # Select Encoding Parameters
-        if ($useNvenc) {
-            $inputParams    = @("-hwaccel", "cuda")
-            $encodingParams = @("-c:v", "h264_nvenc", "-rc", "vbr", "-cq", "23", "-preset", "p4")
-            $videoFilter    = "scale=${targetRes}:force_original_aspect_ratio=decrease,pad=${targetRes}:(ow-iw)/2:(oh-ih)/2"
-        } else {
-            $inputParams    = @()
-            $encodingParams = @("-c:v", "libx264", "-crf", "23", "-preset", "fast")
-            $videoFilter    = "scale=${targetRes}:force_original_aspect_ratio=decrease,pad=${targetRes}:(ow-iw)/2:(oh-ih)/2"
-        }
+        # Common Filters
+        $videoFilter = "scale=${targetRes}:force_original_aspect_ratio=decrease,pad=${targetRes}:(ow-iw)/2:(oh-ih)/2"
 
-        # Build Full Arguments with EXPLICIT QUOTING
-        # We wrap the input filename in "`" string chars so PowerShell passes quotes to FFmpeg
+        # Build Arguments
         $argsList = @("-hide_banner", "-loglevel", "error") + $inputParams + @(
             "-i", "`"$($vid.FullName)`""
         ) + $encodingParams + @(
@@ -310,9 +334,9 @@ if ($videoFiles.Count -eq 0) {
             "-r", $targetFps,
             "-c:a", "aac", "-b:a", "192k",
             "-ac", "2", "-ar", "48000",
-            "-af", "aresample=async=1",
-            "-bsf:v", "h264_mp4toannexb",
-            "-f", "mpegts",
+            "-af", "aresample=async=1"
+        ) + $bsfFilter + @(
+            "-f", $tempFormat,
             "-muxdelay", "0",
             "-y",
             $tsPath
@@ -330,7 +354,7 @@ if ($videoFiles.Count -eq 0) {
             Start-Sleep -Milliseconds 200
         }
 
-        Write-Host "Queueing: $($vid.Name)"
+        Write-Host "Queueing: $($vid.Name) [AV1: $useAv1]"
         $runningJobs += Start-Process -FilePath "ffmpeg" -ArgumentList $argsList -NoNewWindow -PassThru
     }
 
@@ -358,18 +382,22 @@ if ($videoFiles.Count -eq 0) {
             "-i", $fileList
         )
 
-        # Inject Metadata if exists
         if (Test-Path -LiteralPath $metaFile) {
             $concatArgs += @("-i", "`"$metaFile`"", "-map_metadata", "1")
         }
 
         $concatArgs += @(
             "-c", "copy",
-            "-bsf:a", "aac_adtstoasc",
             "-movflags", "+faststart",
             "-y",
             "`"$outputVideo`""
         )
+
+        # h264 needs bitstream filtering during concat if we used TS, but AV1/MKV usually handles it fine.
+        # We generally add aac filtering just in case.
+        if (-not $useAv1) {
+            $concatArgs += @("-bsf:a", "aac_adtstoasc")
+        }
 
         Start-Process -FilePath "ffmpeg" -ArgumentList $concatArgs -Wait -NoNewWindow
         
