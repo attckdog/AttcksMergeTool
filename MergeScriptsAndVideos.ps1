@@ -10,7 +10,7 @@ $maxThreads    = 1
 $targetRes     = "1920:1080"  
 $targetFps     = 60           
 $useNvenc      = $true        # Set to $true to use NVIDIA hardware acceleration
-$useAv1        = $true       # Set to $true to use AV1 (Requires RTX 40-series for NVENC)
+$useAv1        = $false       # Set to $true to use AV1 (Requires RTX 40-series for NVENC)
 
 # Check for FFmpeg/FFprobe availability
 if (-not (Get-Command "ffmpeg" -ErrorAction SilentlyContinue) -or -not (Get-Command "ffprobe" -ErrorAction SilentlyContinue)) {
