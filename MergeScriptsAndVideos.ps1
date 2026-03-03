@@ -11,6 +11,7 @@ $targetRes     = "1920:1080"
 $targetFps     = 60           
 $useNvenc      = $true        # Set to $true to use NVIDIA hardware acceleration
 $useAv1        = $true        # Set to $true to use AV1 (Requires RTX 40-series for NVENC)
+$transitionMs  = 500          # Milliseconds to smooth out the device transition between scene cuts
 
 # --- AXIS MAPPING FOR MULTIFUNPLAYER ---
 # Translates filename/internal axis names to MultiFunPlayer standard IDs
@@ -78,11 +79,66 @@ $metaDesc       = New-Object System.Collections.Generic.List[string]
 $metaNotes      = New-Object System.Collections.Generic.List[string]
 $metaType       = "basic" 
 
+# --- SMOOTHING FUNCTION ---
+function Add-SmoothActions {
+    param (
+        [string]$axisId,
+        [object[]]$actions,
+        [int]$offset,
+        [System.Collections.Generic.List[PSCustomObject]]$targetList,
+        [hashtable]$lastPosMap
+    )
+    
+    if (-not $actions -or $actions.Count -eq 0) { return }
+    
+    if ($lastPosMap.ContainsKey($axisId)) {
+        $prevPos = $lastPosMap[$axisId]
+        # 1. Hold the previous position right up until the video cut
+        $targetList.Add([PSCustomObject]@{ at = $offset; pos = $prevPos })
+        
+        # Ensure we don't extend the transition longer than the current scene actually lasts
+        $safeTransition = [Math]::Min($transitionMs, [int]$actions[-1].at)
+        $lastDroppedPos = -1
+        $droppedAny = $false
+        
+        # 2. Filter actions to bridge the gap gracefully
+        foreach ($action in $actions) {
+            $at = [int]$action.at
+            $pos = [int]$action.pos
+            
+            if ($at -lt $safeTransition) {
+                $lastDroppedPos = $pos
+                $droppedAny = $true
+            } else {
+                if ($droppedAny) {
+                    if ($at -ne $safeTransition) {
+                        $targetList.Add([PSCustomObject]@{ at = ($offset + $safeTransition); pos = $lastDroppedPos })
+                    }
+                    $droppedAny = $false
+                }
+                $targetList.Add([PSCustomObject]@{ at = ($offset + $at); pos = $pos })
+            }
+        }
+        if ($droppedAny) {
+            $targetList.Add([PSCustomObject]@{ at = ($offset + $safeTransition); pos = $lastDroppedPos })
+        }
+    } else {
+        # First file in the merge, just add points normally
+        foreach ($action in $actions) {
+            $targetList.Add([PSCustomObject]@{ at = ($offset + [int]$action.at); pos = [int]$action.pos })
+        }
+    }
+    
+    # 3. Save the final position for the next file
+    $lastPosMap[$axisId] = [int]$actions[-1].pos
+}
+
 if ($scriptFiles.Count -eq 0) {
     Write-Host "No .funscript files found. Skipping script merge." -ForegroundColor Yellow
 } else {
     $globalRootActions = New-Object System.Collections.Generic.List[PSCustomObject]
     $globalAuxAxes     = @{}
+    $globalLastPos     = @{} # Tracks the final position of each axis across scene cuts
     $currentOffset     = 0
     $processedFiles    = New-Object System.Collections.Generic.HashSet[string]
     $vidExts = @(".mp4", ".mkv", ".avi", ".webm", ".m4v", ".ts")
@@ -133,12 +189,10 @@ if ($scriptFiles.Count -eq 0) {
 
             # Root Actions
             if ($mainJson.actions) {
-                foreach ($action in $mainJson.actions) {
-                    $newTime = [int]$action.at + [int]$currentOffset
-                    $globalRootActions.Add([PSCustomObject]@{ at = $newTime; pos = $action.pos })
-                    if ($action.at -gt $maxTimeInScene) { $maxTimeInScene = $action.at }
-                }
+                foreach ($a in $mainJson.actions) { if ([int]$a.at -gt $maxTimeInScene) { $maxTimeInScene = [int]$a.at } }
+                Add-SmoothActions -axisId "L0" -actions $mainJson.actions -offset $currentOffset -targetList $globalRootActions -lastPosMap $globalLastPos
             }
+
             # Embedded Axes
             if ($mainJson.axes) {
                 $metaType = "multiaxis" 
@@ -147,11 +201,9 @@ if ($scriptFiles.Count -eq 0) {
                     $axId = if ($axisMap.ContainsKey($rawId)) { $axisMap[$rawId] } else { $axisObj.id }
                     
                     if (-not $globalAuxAxes.ContainsKey($axId)) { $globalAuxAxes[$axId] = New-Object System.Collections.Generic.List[PSCustomObject] }
-                    foreach ($action in $axisObj.actions) {
-                        $newTime = [int]$action.at + [int]$currentOffset
-                        $globalAuxAxes[$axId].Add([PSCustomObject]@{ at = $newTime; pos = $action.pos })
-                        if ($action.at -gt $maxTimeInScene) { $maxTimeInScene = $action.at }
-                    }
+                    foreach ($a in $axisObj.actions) { if ([int]$a.at -gt $maxTimeInScene) { $maxTimeInScene = [int]$a.at } }
+                    
+                    Add-SmoothActions -axisId $axId -actions $axisObj.actions -offset $currentOffset -targetList $globalAuxAxes[$axId] -lastPosMap $globalLastPos
                 }
             }
             
@@ -184,13 +236,11 @@ if ($scriptFiles.Count -eq 0) {
                         $axisName = if ($axisMap.ContainsKey($rawAxisName)) { $axisMap[$rawAxisName] } else { $matches[1] }
                         
                         if ($subJson.actions) {
-                            Write-Host "`n    + Merging Axis (from actions): [$($matches[1]) -> $axisName]" -ForegroundColor Cyan -NoNewline
+                            Write-Host "`n    + Merging Axis: [$($matches[1]) -> $axisName]" -ForegroundColor Cyan -NoNewline
                             if (-not $globalAuxAxes.ContainsKey($axisName)) { $globalAuxAxes[$axisName] = New-Object System.Collections.Generic.List[PSCustomObject] }
-                            foreach ($action in $subJson.actions) {
-                                $newTime = [int]$action.at + [int]$currentOffset
-                                $globalAuxAxes[$axisName].Add([PSCustomObject]@{ at = $newTime; pos = $action.pos })
-                                if ($action.at -gt $maxTimeInScene) { $maxTimeInScene = $action.at }
-                            }
+                            
+                            foreach ($a in $subJson.actions) { if ([int]$a.at -gt $maxTimeInScene) { $maxTimeInScene = [int]$a.at } }
+                            Add-SmoothActions -axisId $axisName -actions $subJson.actions -offset $currentOffset -targetList $globalAuxAxes[$axisName] -lastPosMap $globalLastPos
                         }
                     }
 
@@ -203,11 +253,9 @@ if ($scriptFiles.Count -eq 0) {
                             
                             Write-Host " [$($axisObj.id) -> $axId]" -ForegroundColor Cyan -NoNewline
                             if (-not $globalAuxAxes.ContainsKey($axId)) { $globalAuxAxes[$axId] = New-Object System.Collections.Generic.List[PSCustomObject] }
-                            foreach ($action in $axisObj.actions) {
-                                $newTime = [int]$action.at + [int]$currentOffset
-                                $globalAuxAxes[$axId].Add([PSCustomObject]@{ at = $newTime; pos = $action.pos })
-                                if ($action.at -gt $maxTimeInScene) { $maxTimeInScene = $action.at }
-                            }
+                            
+                            foreach ($a in $axisObj.actions) { if ([int]$a.at -gt $maxTimeInScene) { $maxTimeInScene = [int]$a.at } }
+                            Add-SmoothActions -axisId $axId -actions $axisObj.actions -offset $currentOffset -targetList $globalAuxAxes[$axId] -lastPosMap $globalLastPos
                         }
                     }
                 }
