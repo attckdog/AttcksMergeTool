@@ -6,11 +6,21 @@ $inputFolder   = ".\Input"
 $tempFolder    = ".\TempTS"
 $fileList      = "filelist.txt"
 $metaFile      = "ffmetadata.txt"
-$maxThreads    = 1            
+$maxThreads    = 3            # Capped at 3 to prevent consumer NVIDIA GPU NVENC session limits
 $targetRes     = "1920:1080"  
 $targetFps     = 60           
 $useNvenc      = $true        # Set to $true to use NVIDIA hardware acceleration
-$useAv1        = $false       # Set to $true to use AV1 (Requires RTX 40-series for NVENC)
+$useAv1        = $true        # Set to $true to use AV1 (Requires RTX 40-series for NVENC)
+
+# --- AXIS MAPPING FOR MULTIFUNPLAYER ---
+# Translates filename/internal axis names to MultiFunPlayer standard IDs
+$axisMap = @{
+    "surge" = "L1"
+    "sway"  = "L2"
+    "twist" = "R0"
+    "roll"  = "R1"
+    "pitch" = "R2"
+}
 
 # Check for FFmpeg/FFprobe availability
 if (-not (Get-Command "ffmpeg" -ErrorAction SilentlyContinue) -or -not (Get-Command "ffprobe" -ErrorAction SilentlyContinue)) {
@@ -27,7 +37,7 @@ Write-Host "========================================================" -Foregroun
 if ($useNvenc) {
     Write-Host "NVENC (Full Hardware Acceleration) is ENABLED." -ForegroundColor Green
 } else {
-    Write-Host "NVENC is DISABLED (Using CPU Encoding).  If you have an nVidia GPU enable this by editting the script." -ForegroundColor Yellow
+    Write-Host "NVENC is DISABLED (Using CPU Encoding)." -ForegroundColor Yellow
 }
 
 $OutputName = Read-Host "Enter the name for the merged file (Default: MergedScript)"
@@ -133,7 +143,9 @@ if ($scriptFiles.Count -eq 0) {
             if ($mainJson.axes) {
                 $metaType = "multiaxis" 
                 foreach ($axisObj in $mainJson.axes) {
-                    $axId = $axisObj.id
+                    $rawId = $axisObj.id.ToLower()
+                    $axId = if ($axisMap.ContainsKey($rawId)) { $axisMap[$rawId] } else { $axisObj.id }
+                    
                     if (-not $globalAuxAxes.ContainsKey($axId)) { $globalAuxAxes[$axId] = New-Object System.Collections.Generic.List[PSCustomObject] }
                     foreach ($action in $axisObj.actions) {
                         $newTime = [int]$action.at + [int]$currentOffset
@@ -157,23 +169,43 @@ if ($scriptFiles.Count -eq 0) {
                 Write-Host " -> Main Chapter Added" -ForegroundColor DarkMagenta -NoNewline
             }
 
-            # C. Process Sibling Files
-            $pattern = "$([regex]::Escape($file.BaseName))\.(.+)\.funscript$"
+            # C. Process Sibling Files (Multi-Axis Support)
             $siblings = Get-ChildItem -LiteralPath $inputFolder -Filter "$($file.BaseName).*.funscript"
             foreach ($sibling in $siblings) {
                 if ($sibling.FullName -ne $file.FullName -and -not $processedFiles.Contains($sibling.FullName)) {
+                    $processedFiles.Add($sibling.FullName) | Out-Null
+                    $subJson = Get-Content -LiteralPath $sibling.FullName | Out-String | ConvertFrom-Json
+                    $metaType = "multiaxis"
+                    
+                    # 1. Map root actions to the axis name found in the filename
+                    $pattern = "$([regex]::Escape($file.BaseName))\.(.+)\.funscript$"
                     if ($sibling.Name -match $pattern) {
-                        $axisName = $matches[1]
-                        Write-Host "`n    + Merging Axis: [$axisName]" -ForegroundColor Cyan -NoNewline
-                        $metaType = "multiaxis"
-                        $processedFiles.Add($sibling.FullName) | Out-Null
-                        $subJson = Get-Content -LiteralPath $sibling.FullName | Out-String | ConvertFrom-Json
+                        $rawAxisName = $matches[1].ToLower()
+                        $axisName = if ($axisMap.ContainsKey($rawAxisName)) { $axisMap[$rawAxisName] } else { $matches[1] }
                         
-                        if (-not $globalAuxAxes.ContainsKey($axisName)) { $globalAuxAxes[$axisName] = New-Object System.Collections.Generic.List[PSCustomObject] }
                         if ($subJson.actions) {
+                            Write-Host "`n    + Merging Axis (from actions): [$($matches[1]) -> $axisName]" -ForegroundColor Cyan -NoNewline
+                            if (-not $globalAuxAxes.ContainsKey($axisName)) { $globalAuxAxes[$axisName] = New-Object System.Collections.Generic.List[PSCustomObject] }
                             foreach ($action in $subJson.actions) {
                                 $newTime = [int]$action.at + [int]$currentOffset
                                 $globalAuxAxes[$axisName].Add([PSCustomObject]@{ at = $newTime; pos = $action.pos })
+                                if ($action.at -gt $maxTimeInScene) { $maxTimeInScene = $action.at }
+                            }
+                        }
+                    }
+
+                    # 2. Map embedded axes from the sibling file natively
+                    if ($subJson.axes) {
+                        Write-Host "`n    + Merging Axes (from embedded):" -ForegroundColor Cyan -NoNewline
+                        foreach ($axisObj in $subJson.axes) {
+                            $rawId = $axisObj.id.ToLower()
+                            $axId = if ($axisMap.ContainsKey($rawId)) { $axisMap[$rawId] } else { $axisObj.id }
+                            
+                            Write-Host " [$($axisObj.id) -> $axId]" -ForegroundColor Cyan -NoNewline
+                            if (-not $globalAuxAxes.ContainsKey($axId)) { $globalAuxAxes[$axId] = New-Object System.Collections.Generic.List[PSCustomObject] }
+                            foreach ($action in $axisObj.actions) {
+                                $newTime = [int]$action.at + [int]$currentOffset
+                                $globalAuxAxes[$axId].Add([PSCustomObject]@{ at = $newTime; pos = $action.pos })
                                 if ($action.at -gt $maxTimeInScene) { $maxTimeInScene = $action.at }
                             }
                         }
@@ -227,7 +259,10 @@ if ($scriptFiles.Count -eq 0) {
         $finalObj.axes += [Ordered]@{ id = $key; actions = $globalAuxAxes[$key] }
     }
     
-    $finalObj | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $outputScript -Encoding UTF8
+    # Write JSON as UTF-8 without BOM (Ensures compatibility with all players)
+    $jsonString = $finalObj | ConvertTo-Json -Depth 10
+    $utf8NoBom = New-Object System.Text.UTF8Encoding $false
+    [System.IO.File]::WriteAllText((Join-Path $PWD $outputScript), $jsonString, $utf8NoBom)
     Write-Host "Success! Saved script to $outputScript" -ForegroundColor Green
 }
 
@@ -236,18 +271,24 @@ if ($scriptFiles.Count -eq 0) {
 # ========================================================
 if ($globalBookmarks.Count -gt 0) {
     Write-Host "Generating Video Chapters metadata..." -ForegroundColor Cyan
+    
+    # Cap the final chapter by inserting an End-of-File marker
+    $globalBookmarks.Add([Ordered]@{ name = "EOF"; time = $totalDurationMs })
+    $sortedBk = $globalBookmarks | Sort-Object time
+
     $sb = New-Object System.Text.StringBuilder
     $sb.AppendLine(";FFMETADATA1") | Out-Null
     $sb.AppendLine("title=$OutputName") | Out-Null
     
-    $sortedBk = $globalBookmarks | Sort-Object time
-
     for ($k = 0; $k -lt ($sortedBk.Count - 1); $k++) {
         $start = [int]$sortedBk[$k].time
         $end   = [int]$sortedBk[$k+1].time
 
         if ($end -eq $start) { continue }
         if ($end -le $start) { $end = $start + 1000 }
+        
+        # Prevent the EOF marker itself from being written as a named chapter
+        if ($sortedBk[$k].name -eq "EOF") { continue } 
 
         $sb.AppendLine("[CHAPTER]") | Out-Null
         $sb.AppendLine("TIMEBASE=1/1000") | Out-Null
@@ -281,95 +322,91 @@ if ($videoFiles.Count -eq 0) {
     $completed = 0
     $jobIndex = 0
 
-    foreach ($vid in $videoFiles) {
-        $jobIndex++
+    try {
+        foreach ($vid in $videoFiles) {
+            $jobIndex++
 
-        # --- CODEC SELECTION LOGIC ---
-        if ($useAv1) {
-            # AV1 requires MKV container for intermediate steps (TS is unstable for AV1)
-            $safeName = "{0:D4}.mkv" -f $jobIndex
-            $tempFormat = "matroska"
-            # AV1 doesn't use the h264 bitstream filter
-            $bsfFilter = @() 
+            # --- CODEC SELECTION LOGIC ---
+            if ($useAv1) {
+                $safeName = "{0:D4}.mkv" -f $jobIndex
+                $tempFormat = "matroska"
+                $bsfFilter = @() 
 
-            if ($useNvenc) {
-                # RTX 40-Series Required for av1_nvenc
-                $inputParams    = @("-hwaccel", "cuda")
-                $encodingParams = @("-c:v", "av1_nvenc", "-rc", "vbr", "-cq", "30", "-preset", "p4")
+                if ($useNvenc) {
+                    $inputParams    = @("-hwaccel", "cuda")
+                    $encodingParams = @("-c:v", "av1_nvenc", "-rc", "vbr", "-cq", "30", "-preset", "p4")
+                } else {
+                    $inputParams    = @()
+                    $encodingParams = @("-c:v", "libsvtav1", "-crf", "30", "-preset", "8")
+                }
             } else {
-                # CPU Encoding (SVT-AV1). Preset 8 is a good speed/quality balance.
-                $inputParams    = @()
-                $encodingParams = @("-c:v", "libsvtav1", "-crf", "30", "-preset", "8")
-            }
-        } else {
-            # H.264 (Standard) - Uses .ts (MPEG-TS)
-            $safeName = "{0:D4}.ts" -f $jobIndex
-            $tempFormat = "mpegts"
-            $bsfFilter = @("-bsf:v", "h264_mp4toannexb")
+                $safeName = "{0:D4}.ts" -f $jobIndex
+                $tempFormat = "mpegts"
+                $bsfFilter = @("-bsf:v", "h264_mp4toannexb")
 
-            if ($useNvenc) {
-                $inputParams    = @("-hwaccel", "cuda")
-                $encodingParams = @("-c:v", "h264_nvenc", "-rc", "vbr", "-cq", "23", "-preset", "p4")
-            } else {
-                $inputParams    = @()
-                $encodingParams = @("-c:v", "libx264", "-crf", "23", "-preset", "fast")
+                if ($useNvenc) {
+                    $inputParams    = @("-hwaccel", "cuda")
+                    $encodingParams = @("-c:v", "h264_nvenc", "-rc", "vbr", "-cq", "23", "-preset", "p4")
+                } else {
+                    $inputParams    = @()
+                    $encodingParams = @("-c:v", "libx264", "-crf", "23", "-preset", "fast")
+                }
             }
+
+            # Safe absolute path for FFmpeg
+            $tsPath = Join-Path $tempFolder $safeName
+            $ffmpegSafePath = $tsPath.Replace('\', '/')
+            "file '$ffmpegSafePath'" | Out-File -FilePath $fileList -Append -Encoding ascii
+
+            $videoFilter = "scale=${targetRes}:force_original_aspect_ratio=decrease,pad=${targetRes}:(ow-iw)/2:(oh-ih)/2"
+
+            $argsList = @("-hide_banner", "-loglevel", "error") + $inputParams + @(
+                "-i", "`"$($vid.FullName)`""
+            ) + $encodingParams + @(
+                "-vf", $videoFilter,
+                "-r", $targetFps,
+                "-c:a", "aac", "-b:a", "192k",
+                "-ac", "2", "-ar", "48000",
+                "-af", "aresample=async=1"
+            ) + $bsfFilter + @(
+                "-f", $tempFormat,
+                "-muxdelay", "0",
+                "-y",
+                $tsPath
+            )
+
+            while ($runningJobs.Count -ge $maxThreads) {
+                $finished = $runningJobs | Where-Object { $_.HasExited }
+                foreach ($job in $finished) {
+                    $completed++
+                    $percent = [int](($completed / $total) * 100)
+                    Write-Progress -Activity "Encoding Videos" -Status "Processing batch... ($completed/$total)" -PercentComplete $percent
+                }
+                $runningJobs = $runningJobs | Where-Object { -not $_.HasExited }
+                Start-Sleep -Milliseconds 200
+            }
+
+            Write-Host "Queueing: $($vid.Name) [AV1: $useAv1]"
+            $runningJobs += Start-Process -FilePath "ffmpeg" -ArgumentList $argsList -NoNewWindow -PassThru
         }
 
-        # Safe sequential path
-        $tsPath = Join-Path $tempFolder $safeName
-        
-        # Add to concat list (Forward slashes required by FFmpeg)
-        $listPath = "TempTS/$safeName" 
-        "file '$listPath'" | Out-File -FilePath $fileList -Append -Encoding ascii
-
-        # Common Filters
-        $videoFilter = "scale=${targetRes}:force_original_aspect_ratio=decrease,pad=${targetRes}:(ow-iw)/2:(oh-ih)/2"
-
-        # Build Arguments
-        $argsList = @("-hide_banner", "-loglevel", "error") + $inputParams + @(
-            "-i", "`"$($vid.FullName)`""
-        ) + $encodingParams + @(
-            "-vf", $videoFilter,
-            "-r", $targetFps,
-            "-c:a", "aac", "-b:a", "192k",
-            "-ac", "2", "-ar", "48000",
-            "-af", "aresample=async=1"
-        ) + $bsfFilter + @(
-            "-f", $tempFormat,
-            "-muxdelay", "0",
-            "-y",
-            $tsPath
-        )
-
-        # Queue Job
-        while ($runningJobs.Count -ge $maxThreads) {
+        while ($runningJobs.Count -gt 0) {
             $finished = $runningJobs | Where-Object { $_.HasExited }
             foreach ($job in $finished) {
                 $completed++
                 $percent = [int](($completed / $total) * 100)
-                Write-Progress -Activity "Encoding Videos" -Status "Processing batch... ($completed/$total)" -PercentComplete $percent
+                Write-Progress -Activity "Encoding Videos" -Status "Finishing last batch... ($completed/$total)" -PercentComplete $percent
             }
             $runningJobs = $runningJobs | Where-Object { -not $_.HasExited }
             Start-Sleep -Milliseconds 200
         }
-
-        Write-Host "Queueing: $($vid.Name) [AV1: $useAv1]"
-        $runningJobs += Start-Process -FilePath "ffmpeg" -ArgumentList $argsList -NoNewWindow -PassThru
-    }
-
-    # Wait for completion
-    while ($runningJobs.Count -gt 0) {
-        $finished = $runningJobs | Where-Object { $_.HasExited }
-        foreach ($job in $finished) {
-            $completed++
-            $percent = [int](($completed / $total) * 100)
-            Write-Progress -Activity "Encoding Videos" -Status "Finishing last batch... ($completed/$total)" -PercentComplete $percent
+        Write-Progress -Activity "Encoding Videos" -Completed
+    } finally {
+        # Cleanup orphaned FFmpeg processes if script is aborted (Ctrl+C)
+        $runningJobs | Where-Object { -not $_.HasExited } | ForEach-Object {
+            Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
         }
-        $runningJobs = $runningJobs | Where-Object { -not $_.HasExited }
-        Start-Sleep -Milliseconds 200
     }
-    Write-Progress -Activity "Encoding Videos" -Completed
 
     # 3. Concatenate and Inject Chapters
     if (Test-Path -LiteralPath $fileList) {
@@ -393,8 +430,6 @@ if ($videoFiles.Count -eq 0) {
             "`"$outputVideo`""
         )
 
-        # h264 needs bitstream filtering during concat if we used TS, but AV1/MKV usually handles it fine.
-        # We generally add aac filtering just in case.
         if (-not $useAv1) {
             $concatArgs += @("-bsf:a", "aac_adtstoasc")
         }
