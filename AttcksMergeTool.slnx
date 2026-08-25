@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="AttcksMergeTool.csproj" />
+  <Project Path="AttcksMergeTool.Tests/AttcksMergeTool.Tests.csproj" />
+</Solution>

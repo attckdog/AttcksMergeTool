@@ -1,0 +1,22 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+
+  <!-- The test project lives in a subfolder of this one, and the SDK's default glob would
+       otherwise compile its sources into the app as well. -->
+  <ItemGroup>
+    <Compile Remove="AttcksMergeTool.Tests\**" />
+    <Compile Remove="graphify-out\**" />
+    <EmbeddedResource Remove="AttcksMergeTool.Tests\**" />
+    <EmbeddedResource Remove="graphify-out\**" />
+    <None Remove="AttcksMergeTool.Tests\**" />
+    <None Remove="graphify-out\**" />
+  </ItemGroup>
+
+</Project>
