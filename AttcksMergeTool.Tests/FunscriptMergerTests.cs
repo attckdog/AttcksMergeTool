@@ -189,23 +189,198 @@ public class FunscriptMergerTests
     }
 
     /// <remarks>
-    /// Without this the device would snap from wherever the last scene left off to wherever
-    /// the next one opens, at the exact moment the video cuts.
+    /// Without the gap the device would be asked to snap from wherever the last scene left off
+    /// to wherever the next one opens, at the exact moment the video cuts. The black is the
+    /// time it needs to make that move, and the single point halfway through is the whole
+    /// instruction - the player draws the ease into and out of it.
     /// </remarks>
     [Fact]
-    public async Task The_seam_is_anchored_and_the_transition_window_is_collapsed() {
+    public async Task A_gap_separates_the_scenes_and_parks_every_axis_halfway_through_it() {
         using var workspace = new TempWorkspace();
         Seed(workspace, "A", (0, 0), (1000, 100));
-        Seed(workspace, "B", (100, 10), (200, 20), (600, 60));
+        Seed(workspace, "B", (100, 10), (600, 60));
 
         var probe = new FakeMediaProbe().WithDuration("A.mp4", 2000).WithDuration("B.mp4", 1000);
 
         Funscript merged = await MergeAsync(
-            workspace, nameof(The_seam_is_anchored_and_the_transition_window_is_collapsed), probe);
+            workspace, nameof(A_gap_separates_the_scenes_and_parks_every_axis_halfway_through_it),
+            probe, gaps: true);
+
+        // A ends at 100 and B opens at 10, so the outbound leg is 50 units - 500ms at the
+        // default 100 units/sec, and 1000ms for the pair. B therefore starts at 3000, and its
+        // own keyframes are appended from there untouched.
+        Assert.Equal(
+            [(0, 0), (1000, 100), (2500, 50), (3100, 10), (3600, 60)],
+            merged.Actions!.Select(action => (action.At, action.Pos)));
+
+        Assert.Equal([0, 3000], merged.Bookmarks!.Select(bookmark => bookmark.Time));
+        Assert.Equal(4, merged.Metadata!.Duration);
+    }
+
+    /// <remarks>
+    /// The bookmark marks the scene, and the scene starts where its video does. Putting it at
+    /// the top of the lead-in would have every chapter open on a second of black.
+    /// </remarks>
+    [Fact]
+    public async Task Nothing_is_inserted_in_front_of_the_first_scene() {
+        using var workspace = new TempWorkspace();
+        Seed(workspace, "A", (0, 100), (1000, 0));
+        Seed(workspace, "B", (0, 100));
+
+        var probe = new FakeMediaProbe().WithDuration("A.mp4", 2000).WithDuration("B.mp4", 1000);
+
+        Funscript merged = await MergeAsync(
+            workspace, nameof(Nothing_is_inserted_in_front_of_the_first_scene), probe, gaps: true);
+
+        Assert.Equal(0, merged.Bookmarks![0].Time);
+        Assert.Equal(0, merged.Actions![0].At);
+    }
+
+    /// <remarks>
+    /// It has to reach the halfway park like everything else, and then it holds there for the
+    /// whole of the scene that says nothing about it - rather than staying wherever the last
+    /// scene that did script it left it.
+    /// </remarks>
+    [Fact]
+    public async Task An_axis_the_next_scene_does_not_script_is_parked_and_left_there() {
+        using var workspace = new TempWorkspace();
+        Seed(workspace, "A", (0, 0), (1000, 50));
+        workspace.WriteScript("A.twist.funscript", ScriptBuilder.Basic((0, 0), (900, 100)));
+        Seed(workspace, "B", (0, 50));
+
+        var probe = new FakeMediaProbe().WithDuration("A.mp4", 2000).WithDuration("B.mp4", 1000);
+
+        Funscript merged = await MergeAsync(
+            workspace, nameof(An_axis_the_next_scene_does_not_script_is_parked_and_left_there),
+            probe, gaps: true);
+
+        // The stroke axis has nowhere to go - it ends and reopens at 50 - but twist ends at 100
+        // and so still needs its 50 units of travel, which is what sizes the gap for everyone.
+        FunscriptAxis twist = Assert.Single(merged.Axes!);
+
+        Assert.Equal("R0", twist.Id);
+        Assert.Equal([(0, 0), (900, 100), (2500, 50)], twist.Actions!.Select(action => (action.At, action.Pos)));
+        Assert.Equal([0, 3000], merged.Bookmarks!.Select(bookmark => bookmark.Time));
+    }
+
+    [Fact]
+    public async Task A_slower_speed_limit_makes_the_gap_longer() {
+        using var workspace = new TempWorkspace();
+        Seed(workspace, "A", (0, 0), (1000, 100));
+        Seed(workspace, "B", (0, 0));
+
+        var probe = new FakeMediaProbe().WithDuration("A.mp4", 2000).WithDuration("B.mp4", 1000);
+
+        Funscript merged = await MergeAsync(
+            workspace, nameof(A_slower_speed_limit_makes_the_gap_longer), probe, gaps: true, maxAxisSpeed: 50);
+
+        // 50 units per leg at 50 units/sec is a second each way.
+        Assert.Equal(4000, merged.Bookmarks![1].Time);
+    }
+
+    /// <remarks>
+    /// The video stage reads its filler lengths out of these, so a lead-in the script spent but
+    /// did not record would leave the merged video a gap shorter than the merged script.
+    /// </remarks>
+    [Fact]
+    public async Task Each_span_records_the_gap_in_front_of_its_own_scene() {
+        using var workspace = new TempWorkspace();
+        Seed(workspace, "A", (0, 0), (1000, 100));
+        Seed(workspace, "B", (0, 0));
+
+        var probe = new FakeMediaProbe().WithDuration("A.mp4", 2000).WithDuration("B.mp4", 1000);
+
+        FunscriptMergeResult result = (await MergeResultAsync(
+            workspace, nameof(Each_span_records_the_gap_in_front_of_its_own_scene), probe, gaps: true))!;
+
+        Assert.Equal([0, 1000], result.Spans.Select(span => span.LeadInMs));
+        Assert.Equal([0, 3000], result.Spans.Select(span => span.StartMs));
+        Assert.Equal(4000, result.TotalDurationMs);
+    }
+
+    /// <remarks>
+    /// The scenes' own keyframes are what the script asked for. The seam was already smoothed
+    /// by the gap, so collapsing the opening ones on top of that would only throw motion away.
+    /// </remarks>
+    [Fact]
+    public async Task A_scenes_own_keyframes_are_appended_untouched() {
+        using var workspace = new TempWorkspace();
+        Seed(workspace, "A", (0, 0), (1000, 100));
+        Seed(workspace, "B", (10, 10), (20, 20), (30, 30));
+
+        var probe = new FakeMediaProbe().WithDuration("A.mp4", 2000).WithDuration("B.mp4", 1000);
+
+        Funscript merged = await MergeAsync(
+            workspace, nameof(A_scenes_own_keyframes_are_appended_untouched), probe, gaps: true);
 
         Assert.Equal(
-            [(0, 0), (1000, 100), (2000, 100), (2500, 20), (2600, 60)],
-            merged.Actions!.Select(action => (action.At, action.Pos)));
+            [(3010, 10), (3020, 20), (3030, 30)],
+            merged.Actions!.Skip(3).Select(action => (action.At, action.Pos)));
+    }
+
+    /// <remarks>
+    /// Stray keyframes past the end of a scene's video would sit on top of the scenes after
+    /// it, and the retime - which keeps the axis sorted - would then flatten every later scene
+    /// onto their timestamp. Real-world case: a 43s scene with leftover points at 165-175s.
+    /// </remarks>
+    [Fact]
+    public async Task Keyframes_past_the_end_of_the_video_are_dropped() {
+        using var workspace = new TempWorkspace();
+        Seed(workspace, "A", (0, 0), (1000, 100), (9000, 50), (9500, 60));
+        Seed(workspace, "B", (0, 0), (500, 50));
+
+        var probe = new FakeMediaProbe().WithDuration("A.mp4", 2000).WithDuration("B.mp4", 1000);
+
+        Funscript merged = await MergeAsync(
+            workspace, nameof(Keyframes_past_the_end_of_the_video_are_dropped), probe);
+
+        Assert.Equal([0, 1000, 2000, 2500], merged.Actions!.Select(action => action.At));
+    }
+
+    [Fact]
+    public async Task An_unsorted_script_is_merged_in_time_order() {
+        using var workspace = new TempWorkspace();
+        Seed(workspace, "A", (1000, 100), (0, 0), (500, 50));
+        Seed(workspace, "B", (0, 0));
+
+        var probe = new FakeMediaProbe().WithDuration("A.mp4", 2000).WithDuration("B.mp4", 1000);
+
+        Funscript merged = await MergeAsync(
+            workspace, nameof(An_unsorted_script_is_merged_in_time_order), probe);
+
+        Assert.Equal([0, 500, 1000, 2000], merged.Actions!.Select(action => action.At));
+    }
+
+    [Fact]
+    public async Task Turning_gaps_off_joins_the_scenes_directly() {
+        using var workspace = new TempWorkspace();
+        Seed(workspace, "A", (0, 0), (1000, 100));
+        Seed(workspace, "B", (0, 0));
+
+        var probe = new FakeMediaProbe().WithDuration("A.mp4", 2000).WithDuration("B.mp4", 1000);
+
+        Funscript merged = await MergeAsync(
+            workspace, nameof(Turning_gaps_off_joins_the_scenes_directly), probe, gaps: false);
+
+        Assert.Equal([(0, 0), (1000, 100), (2000, 0)], merged.Actions!.Select(action => (action.At, action.Pos)));
+        Assert.Equal([0, 2000], merged.Bookmarks!.Select(bookmark => bookmark.Time));
+    }
+
+    /// <remarks>
+    /// Nothing has to move, so interrupting the video would buy nothing.
+    /// </remarks>
+    [Fact]
+    public async Task Scenes_that_meet_at_the_parked_position_get_no_gap() {
+        using var workspace = new TempWorkspace();
+        Seed(workspace, "A", (0, 0), (1000, 50));
+        Seed(workspace, "B", (0, 50));
+
+        var probe = new FakeMediaProbe().WithDuration("A.mp4", 2000).WithDuration("B.mp4", 1000);
+
+        Funscript merged = await MergeAsync(
+            workspace, nameof(Scenes_that_meet_at_the_parked_position_get_no_gap), probe, gaps: true);
+
+        Assert.Equal([0, 2000], merged.Bookmarks!.Select(bookmark => bookmark.Time));
     }
 
     [Fact]
@@ -262,10 +437,10 @@ public class FunscriptMergerTests
         Assert.Equal("alpha", axis.Id);
         Assert.Equal([0, 900], axis.Actions!.Select(action => action.At));
 
-        // The root axis carries only what the two main scripts contributed - A's keyframes, the
-        // seam anchor at A's final position, then B's - and nothing from the alpha file.
+        // The root axis carries only what the two main scripts contributed - A's keyframes then
+        // B's - and nothing from the alpha file.
         Assert.Equal(
-            [(0, 0), (1000, 100), (2000, 100), (2000, 0)],
+            [(0, 0), (1000, 100), (2000, 0)],
             merged.Actions!.Select(action => (action.At, action.Pos)));
     }
 
@@ -317,21 +492,49 @@ public class FunscriptMergerTests
             }
         ]);
 
+    /// <remarks>
+    /// Read back off disk rather than taken from the result, so what is asserted is the file a
+    /// player would actually open.
+    /// </remarks>
     private static async Task<Funscript> MergeAsync(
         TempWorkspace workspace,
         string outputName,
         FakeMediaProbe probe,
         TrimLookup? trims = null,
-        FakeJobLogger? logger = null) {
-        MergeOptions options = workspace.Options(outputName);
+        FakeJobLogger? logger = null,
+        bool gaps = false,
+        int maxAxisSpeed = 100) {
+        MergeOptions options = workspace.Options(
+            outputName, insertTransitionGaps: gaps, maxAxisSpeed: maxAxisSpeed);
 
+        await MergeResultAsync(workspace, options, probe, trims, logger);
+
+        return JsonSerializer.Deserialize<Funscript>(File.ReadAllText(options.OutputScriptPath), ReadOptions)!;
+    }
+
+    private static Task<FunscriptMergeResult?> MergeResultAsync(
+        TempWorkspace workspace,
+        string outputName,
+        FakeMediaProbe probe,
+        bool gaps = false) =>
+        MergeResultAsync(
+            workspace,
+            workspace.Options(outputName, insertTransitionGaps: gaps),
+            probe,
+            trims: null,
+            logger: null);
+
+    private static async Task<FunscriptMergeResult?> MergeResultAsync(
+        TempWorkspace workspace,
+        MergeOptions options,
+        FakeMediaProbe probe,
+        TrimLookup? trims,
+        FakeJobLogger? logger) {
         var merger = new FunscriptMerger(logger ?? new FakeJobLogger(), options, trims ?? TrimLookup.Empty, probe);
 
         TimelinePlan plan = TimelinePlan.Build(
             SceneScriptIndex.Build(workspace.Root), MediaFileScanner.FindVideos(workspace.Root));
 
-        await merger.MergeAsync(plan.Entries);
-
-        return JsonSerializer.Deserialize<Funscript>(File.ReadAllText(options.OutputScriptPath), ReadOptions)!;
+        return await merger.MergeAsync(plan.Entries);
     }
 }

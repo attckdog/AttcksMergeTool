@@ -71,6 +71,12 @@ public sealed partial class MainForm : Form
     private string InputFolder => MergeOptions.ResolvePath(_settings.InputFolder);
 
     /// <summary>
+    /// How the input folder is walked, taken from the job's own view of the settings so the
+    /// list is built from exactly the files a merge would find.
+    /// </summary>
+    private InputScan InputScan => MergeOptions.FromSettings(_settings).InputScan;
+
+    /// <summary>
     /// Where the merged video and script are written. Blank means beside the executable,
     /// the same reading <see cref="MergeOptions.OutputFolder"/> gives it.
     /// </summary>
@@ -120,7 +126,15 @@ public sealed partial class MainForm : Form
             return;
         }
 
-        List<string> videoFiles = MediaFileScanner.FindVideos(InputFolder, _settings.VideoExtensions);
+        List<string> videoFiles = MediaFileScanner.FindVideos(
+            InputFolder, _settings.VideoExtensions, InputScan);
+
+        // Said here as well as at merge time: this is where the two identically named rows
+        // appear, and it is the moment the user can still rename a file to fix it.
+        if (_settings.IncludeInputSubfolders
+            && MediaFileScanner.AmbiguousNameWarning(videoFiles) is { } warning) {
+            _logger.Log(warning, LogLevel.Warning);
+        }
 
         _videoSettings.RemoveAll(s => !videoFiles.Contains(s.FilePath));
 
@@ -192,7 +206,7 @@ public sealed partial class MainForm : Form
     /// </summary>
     private ListViewItem BuildRow(VideoSegmentSettings settings) {
         // Per-subitem colours, so one unread cell can be greyed without greying the row.
-        var item = new ListViewItem(settings.FileName) { Tag = settings, UseItemStyleForSubItems = false };
+        var item = new ListViewItem(RowLabel(settings)) { Tag = settings, UseItemStyleForSubItems = false };
 
         item.SubItems.Add(string.Empty);
         item.SubItems.Add(string.Empty);
@@ -205,7 +219,7 @@ public sealed partial class MainForm : Form
 
     /// <summary>Rewrites every cell of <paramref name="item"/> from the details read so far.</summary>
     private void UpdateRow(ListViewItem item, VideoSegmentSettings settings) {
-        SetCell(item, NameColumn, settings.FileName, Theme.Text);
+        SetCell(item, NameColumn, RowLabel(settings), Theme.Text);
 
         if (_details.GetValueOrDefault(settings.FilePath) is not { } details) {
             // Not read yet. Saying so beats showing a zero, which would look like an answer.
@@ -237,6 +251,25 @@ public sealed partial class MainForm : Form
             AxesColumn,
             details.AxisCount > 0 ? details.AxisCount.ToString() : "-",
             details.AxisCount > 0 ? Theme.Text : Theme.MutedText);
+    }
+
+    /// <summary>
+    /// How a file is named in the list: its filename, or its path relative to the input folder
+    /// while subfolders are being scanned - two videos called "intro.mp4" in different folders
+    /// would otherwise be the same row twice, with no way to tell which is which.
+    /// </summary>
+    private string RowLabel(VideoSegmentSettings settings) {
+        if (!_settings.IncludeInputSubfolders) return settings.FileName;
+
+        try {
+            string relative = Path.GetRelativePath(InputFolder, settings.FilePath);
+
+            // A path that climbs out of the input folder is not relative to it in any useful
+            // sense; the filename says more than "..\..\elsewhere\intro.mp4" would.
+            return relative.StartsWith("..", StringComparison.Ordinal) ? settings.FileName : relative;
+        } catch (ArgumentException) {
+            return settings.FileName;
+        }
     }
 
     private static void SetCell(ListViewItem item, int column, string text, Color foreground) {
@@ -300,7 +333,7 @@ public sealed partial class MainForm : Form
         // Built once for the whole scan rather than per row: classifying the scenes means
         // looking at every funscript in the folder next to every other one.
         Dictionary<string, SceneScripts> scenes = SceneScriptIndex
-            .Build(InputFolder, _settings.VideoExtensions)
+            .Build(InputFolder, _settings.VideoExtensions, InputScan)
             .ToDictionary(scene => scene.Name, StringComparer.OrdinalIgnoreCase);
 
         var probe = new FFprobe(ProcessRunner.Default, MergeOptions.FromSettings(_settings).FfprobePath);
@@ -452,7 +485,7 @@ public sealed partial class MainForm : Form
         settings.EndTime = (double)_numEnd.Value;
 
         RefreshVideoList();
-        _logger.Log($"Saved settings for {settings.FileName}");
+        _logger.Log($"Saved settings for {RowLabel(settings)}");
     }
 
     private async void BtnStart_Click(object? sender, EventArgs e) {
@@ -527,6 +560,7 @@ public sealed partial class MainForm : Form
 
     private static bool ScansTheSameFiles(AppSettings before, AppSettings after) =>
         string.Equals(before.InputFolder, after.InputFolder, StringComparison.OrdinalIgnoreCase)
+        && before.IncludeInputSubfolders == after.IncludeInputSubfolders
         && before.VideoExtensions.SequenceEqual(after.VideoExtensions);
 
     /// <summary>

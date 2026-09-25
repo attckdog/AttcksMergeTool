@@ -24,7 +24,9 @@ public class MergeOptionsTests
             AudioBitrate = "320k",
             AudioChannels = 6,
             AudioSampleRate = 44100,
-            TransitionMs = 250,
+            InsertTransitionGaps = false,
+            MaxAxisSpeed = 250,
+            IncludeInputSubfolders = true,
             VideoExtensions = [".mp4", ".mkv"]
         };
 
@@ -44,8 +46,32 @@ public class MergeOptionsTests
         Assert.Equal("320k", options.AudioBitrate);
         Assert.Equal(6, options.AudioChannels);
         Assert.Equal(44100, options.AudioSampleRate);
-        Assert.Equal(250, options.TransitionMs);
+        Assert.False(options.InsertTransitionGaps);
+        Assert.Equal(250, options.MaxAxisSpeed);
         Assert.Equal([".mp4", ".mkv"], options.VideoExtensions);
+        Assert.True(options.IncludeInputSubfolders);
+    }
+
+    /// <remarks>
+    /// The temp and output folders move with the settings, so the exclusions have to be read
+    /// off the job rather than fixed anywhere: a recursive scan that walked into either one
+    /// would feed the run its own intermediates or its last output.
+    /// </remarks>
+    [Fact]
+    public void The_scan_a_job_walks_its_input_with_keeps_out_the_folders_it_writes_into() {
+        var options = new MergeOptions {
+            IncludeInputSubfolders = true,
+            InputFolder = "Input",
+            TempFolder = "Input/TempTS",
+            OutputFolder = "Input/Merged"
+        };
+
+        Assert.True(options.InputScan.Recursive);
+
+        Assert.Equal(
+            [options.TempFolder, options.OutputFolder],
+            options.InputScan.ExcludedSubtreesOf(options.InputFolder)
+                .Select(folder => folder.TrimEnd(Path.DirectorySeparatorChar)));
     }
 
     /// <summary>

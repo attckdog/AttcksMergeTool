@@ -133,6 +133,7 @@ public sealed partial class OptionsForm : Form
 
     private void LoadFrom(AppSettings settings) {
         _txtInputFolder.Text = settings.InputFolder;
+        _chkIncludeSubfolders.Checked = settings.IncludeInputSubfolders;
         _txtTempFolder.Text = settings.TempFolder;
         _txtOutputFolder.Text = settings.OutputFolder;
         _txtConcatListFile.Text = settings.ConcatListFile;
@@ -155,7 +156,8 @@ public sealed partial class OptionsForm : Form
         _numAudioSampleRate.Value = Clamp(_numAudioSampleRate, settings.AudioSampleRate);
 
         _txtOutputName.Text = settings.OutputName;
-        _numTransitionMs.Value = Clamp(_numTransitionMs, settings.TransitionMs);
+        _chkTransitionGaps.Checked = settings.InsertTransitionGaps;
+        _numMaxAxisSpeed.Value = Clamp(_numMaxAxisSpeed, settings.MaxAxisSpeed);
         _txtVideoExtensions.Text = string.Join(", ", settings.VideoExtensions);
 
         _chkRememberBounds.Checked = settings.RememberWindowBounds;
@@ -173,6 +175,7 @@ public sealed partial class OptionsForm : Form
     /// </summary>
     private void ApplyTo(AppSettings settings) {
         settings.InputFolder = _txtInputFolder.Text;
+        settings.IncludeInputSubfolders = _chkIncludeSubfolders.Checked;
         settings.TempFolder = _txtTempFolder.Text;
         settings.OutputFolder = _txtOutputFolder.Text;
         settings.ConcatListFile = _txtConcatListFile.Text;
@@ -195,7 +198,8 @@ public sealed partial class OptionsForm : Form
         settings.AudioSampleRate = (int)_numAudioSampleRate.Value;
 
         settings.OutputName = _txtOutputName.Text;
-        settings.TransitionMs = (int)_numTransitionMs.Value;
+        settings.InsertTransitionGaps = _chkTransitionGaps.Checked;
+        settings.MaxAxisSpeed = (int)_numMaxAxisSpeed.Value;
         settings.VideoExtensions = [.. _txtVideoExtensions.Text.Split(
             [',', ';', ' ', '\t'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)];
 

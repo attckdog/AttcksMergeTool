@@ -18,6 +18,12 @@ public static class ChapterBuilder
     /// Chapters laid end to end from the measured segment durations. Returns an empty list if
     /// any segment is unmeasured, because one unknown length invalidates every boundary after it.
     /// </summary>
+    /// <remarks>
+    /// A transition gap gets no chapter of its own. It extends the one before it instead, so
+    /// every chapter starts on its scene's first real frame - seeking to one lands on content
+    /// rather than on a second of black. The gap's time is still counted, so the chapters stay
+    /// contiguous and still cover the whole output.
+    /// </remarks>
     public static IReadOnlyList<Chapter> FromSegments(IReadOnlyList<EncodedSegment> segments) {
         var chapters = new List<Chapter>(segments.Count);
         int startMs = 0;
@@ -26,7 +32,16 @@ public static class ChapterBuilder
             if (segment.DurationMs is not > 0) return [];
 
             int endMs = startMs + segment.DurationMs.Value;
-            chapters.Add(new Chapter(segment.SceneName, startMs, endMs));
+
+            if (segment.IsGap) {
+                // A leading gap has no chapter to extend. The merger never emits one, but if
+                // it ever did the black would simply belong to no chapter rather than
+                // displacing the first scene's title onto it.
+                if (chapters.Count > 0) chapters[^1] = chapters[^1] with { EndMs = endMs };
+            } else {
+                chapters.Add(new Chapter(segment.SceneName, startMs, endMs));
+            }
+
             startMs = endMs;
         }
 
@@ -37,6 +52,11 @@ public static class ChapterBuilder
     /// Chapters spanning each scene marker to the next, with the merged timeline length
     /// closing the last one.
     /// </summary>
+    /// <remarks>
+    /// Markers sit on their scene's first real frame, and each chapter runs to the next marker
+    /// - so a transition gap falls inside the chapter before it here too, without this having
+    /// to know gaps exist.
+    /// </remarks>
     public static IReadOnlyList<Chapter> FromBookmarks(FunscriptMergeResult mergeResult) {
         IReadOnlyList<Bookmark> markers = mergeResult.Bookmarks;
         var chapters = new List<Chapter>(markers.Count);

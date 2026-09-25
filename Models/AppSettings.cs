@@ -36,6 +36,17 @@ public sealed class AppSettings
     // --- Paths ---
 
     public string InputFolder { get; set; } = MergeOptions.DefaultInputFolder;
+
+    /// <summary>
+    /// Scan every folder under <see cref="InputFolder"/> as well as its top level.
+    /// </summary>
+    /// <remarks>
+    /// Off, like the rest of this file: the top level alone is what the scan did before the
+    /// option existed. Scenes are still identified by filename wherever they sit, so a
+    /// recursive scan that finds one name in two folders is reported rather than guessed at.
+    /// </remarks>
+    public bool IncludeInputSubfolders { get; set; }
+
     public string TempFolder { get; set; } = MergeOptions.DefaultTempFolder;
 
     /// <summary>Where the merged video and script land. Empty means "beside the executable".</summary>
@@ -90,10 +101,16 @@ public sealed class AppSettings
     public string OutputName { get; set; } = MergeOptions.DefaultOutputName;
 
     /// <summary>
-    /// Window at the head of each scene over which keyframes are collapsed, so the device
-    /// eases from the previous scene's final position instead of snapping.
+    /// Insert a stretch of black between scenes, long enough for every axis to reach the
+    /// position the next scene opens at without exceeding <see cref="MaxAxisSpeed"/>.
     /// </summary>
-    public int TransitionMs { get; set; } = 500;
+    public bool InsertTransitionGaps { get; set; } = true;
+
+    /// <summary>
+    /// Ceiling on axis travel across a scene seam, in position units per second. It is what
+    /// sizes the black gap: the slower the limit, the longer the gap has to be.
+    /// </summary>
+    public int MaxAxisSpeed { get; set; } = 100;
 
     /// <summary>
     /// Leave a video out of the merge when no funscript shares its name.
@@ -176,7 +193,11 @@ public sealed class AppSettings
         AudioSampleRate = Math.Clamp(AudioSampleRate, 8000, 192000);
 
         OutputName = MergeOptions.NormalizeOutputName(OutputName);
-        TransitionMs = Math.Clamp(TransitionMs, 0, 10000);
+
+        // The floor is what bounds the gap. An axis travels at most 50 units per leg, so the
+        // slowest speed still allowed puts the longest possible gap at 10 seconds; anything
+        // lower would let a hand-edited settings file stall the output for minutes.
+        MaxAxisSpeed = Math.Clamp(MaxAxisSpeed, 10, 1000);
 
         VideoExtensions = NormalizeExtensions(VideoExtensions) is { Count: > 0 } extensions
             ? extensions

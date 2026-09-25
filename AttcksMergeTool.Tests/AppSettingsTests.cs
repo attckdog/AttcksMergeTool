@@ -15,7 +15,7 @@ public class AppSettingsTests
             TargetFps = 0,
             Av1Quality = -5,
             H264Quality = 500,
-            TransitionMs = -1,
+            MaxAxisSpeed = 5000,
             AudioChannels = 64,
             LogFontSize = 400F
         };
@@ -26,7 +26,7 @@ public class AppSettingsTests
         Assert.Equal(1, settings.TargetFps);
         Assert.Equal(0, settings.Av1Quality);
         Assert.Equal(63, settings.H264Quality);
-        Assert.Equal(0, settings.TransitionMs);
+        Assert.Equal(1000, settings.MaxAxisSpeed);
         Assert.Equal(8, settings.AudioChannels);
         Assert.Equal(24F, settings.LogFontSize);
     }

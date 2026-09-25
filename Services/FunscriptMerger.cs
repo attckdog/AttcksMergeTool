@@ -10,7 +10,15 @@ namespace AttcksMergeTool.Services;
 /// order the videos are concatenated in. Each scene advances the running offset by its
 /// video's duration when it has one and by its own last keyframe otherwise, so the merged
 /// script stays aligned with the merged video - including across a video that has no script
-/// at all, which contributes its length as silence. Auxiliary axes - whether
+/// at all, which contributes its length as silence.
+/// <para>
+/// Between scenes sits a gap: black that the video stage generates, sized by
+/// <see cref="TransitionGap"/> so no axis has to travel faster than the configured limit to
+/// reach the position the next scene opens at. Each scene is therefore read in full before
+/// the gap in front of it can be measured, which is why merging one is two passes - prepare,
+/// then append - rather than a single walk.
+/// </para>
+/// Auxiliary axes - whether
 /// embedded in the document or supplied as <c>{scene}.{axis}.funscript</c> siblings -
 /// are accumulated per axis id and emitted together at the end. Each input's descriptive
 /// metadata is unioned into the merged document's own metadata block.
@@ -71,21 +79,64 @@ public sealed class FunscriptMerger
         (int sceneDurationMs, bool videoFound, TrimWindow trim) =
             await ResolveSceneTimingAsync(entry, cancellationToken);
 
+        // Keyframes past the end of the video would land on top of the scenes after this one,
+        // so a scene with a known length is held to it. Script-only scenes have no such limit.
+        int? endMs = videoFound && sceneDurationMs > 0 ? sceneDurationMs : null;
+
+        // Read before anything is emitted: the gap in front of this scene is sized by where
+        // its axes open, which is not known until its files have been read and trimmed.
+        PreparedScene prepared = await PrepareSceneAsync(entry.Scripts, state, trim, endMs, cancellationToken);
+
+        if (prepared.DroppedPastEnd > 0) {
+            _logger.Log(
+                $"  -> Dropped {prepared.DroppedPastEnd} keyframe(s) past the end of the video "
+                + $"({sceneDurationMs}ms). The script runs longer than its scene.",
+                LogLevel.Warning);
+        }
+
+        int leadInMs = InsertGap(prepared, state);
         int sceneStartMs = state.CurrentOffsetMs;
 
-        // Measured against the keyframes actually appended, which are rebased onto the trimmed
-        // timeline. Taking it from the source timestamps instead would overshoot by the trim's
-        // start offset on any scene that has to fall back to it.
-        int lastKeyframeMs = 0;
-        SceneScripts? scene = entry.Scripts;
+        foreach (SceneTrack track in prepared.Tracks) Append(track, state);
 
-        if (scene?.MainScriptPath is not null) {
+        // Emitted for every entry, including a video that has no script at all, so the merged
+        // script's markers and the output's chapters describe exactly the same scenes. It
+        // marks the first real frame, past the lead-in rather than at the start of it.
+        state.Bookmarks.Add(new Bookmark { Name = entry.Name, Time = sceneStartMs });
+
+        // A real video duration wins, because it accounts for silent tails the script omits.
+        int sceneLengthMs = videoFound && sceneDurationMs > 0 ? sceneDurationMs : prepared.LastKeyframeMs;
+
+        state.Spans.Add(new SceneSpan(entry.Name, sceneStartMs, sceneLengthMs, leadInMs));
+        state.CurrentOffsetMs = sceneStartMs + sceneLengthMs;
+    }
+
+    /// <summary>
+    /// Reads everything one scene contributes - its main script, the axes embedded in it, and
+    /// its <c>{scene}.{axis}.funscript</c> siblings - and trims each onto a zero-based
+    /// timeline, without committing any of it to the merge.
+    /// </summary>
+    /// <remarks>
+    /// Nothing here touches the running offset, because the offset is not settled yet: the gap
+    /// this scene sits behind depends on what these tracks turn out to open at. Only the
+    /// accumulators that are order-independent - metadata, the script type, and the
+    /// registration of embedded axes - are written through to <paramref name="state"/>.
+    /// </remarks>
+    private async Task<PreparedScene> PrepareSceneAsync(
+        SceneScripts? scene,
+        MergeState state,
+        TrimWindow trim,
+        int? endMs,
+        CancellationToken cancellationToken) {
+        var prepared = new PreparedScene(endMs);
+
+        if (scene is null) return prepared;
+
+        if (scene.MainScriptPath is not null) {
             Funscript script = await ScriptReader.ReadAsync(scene.MainScriptPath, cancellationToken);
             state.Metadata.Add(script.Metadata);
 
-            lastKeyframeMs = Math.Max(
-                lastKeyframeMs,
-                AppendActions(FunscriptAxisMap.RootAxisId, script.Actions, state, state.RootActions, trim));
+            prepared.Add(FunscriptAxisMap.RootAxisId, script.Actions, trim);
 
             if (script.Axes is { Count: > 0 }) {
                 state.ScriptType = MultiAxisScriptType;
@@ -94,40 +145,13 @@ public sealed class FunscriptMerger
                     string axisId = FunscriptAxisMap.Resolve(axis.Id, axis.Id);
 
                     // Register the axis even when empty, matching the original output shape.
-                    List<ActionPoint> target = state.AxisActions(axisId);
+                    // The root track does not live in that list, so it is left out of it.
+                    if (axisId != FunscriptAxisMap.RootAxisId) state.AxisActions(axisId);
 
-                    lastKeyframeMs = Math.Max(
-                        lastKeyframeMs, AppendActions(axisId, axis.Actions, state, target, trim));
+                    prepared.Add(axisId, axis.Actions, trim);
                 }
             }
         }
-
-        // Emitted for every entry, including a video that has no script at all, so the merged
-        // script's markers and the output's chapters describe exactly the same scenes.
-        state.Bookmarks.Add(new Bookmark { Name = entry.Name, Time = sceneStartMs });
-
-        if (scene is not null) {
-            int siblingKeyframeMs = await MergeSiblingScriptsAsync(scene, state, trim, cancellationToken);
-            lastKeyframeMs = Math.Max(lastKeyframeMs, siblingKeyframeMs);
-        }
-
-        // A real video duration wins, because it accounts for silent tails the script omits.
-        int sceneLengthMs = videoFound && sceneDurationMs > 0 ? sceneDurationMs : lastKeyframeMs;
-
-        state.Spans.Add(new SceneSpan(entry.Name, sceneStartMs, sceneLengthMs));
-        state.CurrentOffsetMs = sceneStartMs + sceneLengthMs;
-    }
-
-    /// <summary>
-    /// Folds in the per-axis <c>{scene}.{axis}.funscript</c> files and reports the latest
-    /// keyframe appended across them.
-    /// </summary>
-    private async Task<int> MergeSiblingScriptsAsync(
-        SceneScripts scene,
-        MergeState state,
-        TrimWindow trim,
-        CancellationToken cancellationToken) {
-        int lastKeyframeMs = 0;
 
         foreach (string siblingPath in scene.SiblingScriptPaths) {
             Funscript sibling = await ScriptReader.ReadAsync(siblingPath, cancellationToken);
@@ -136,16 +160,11 @@ public sealed class FunscriptMerger
 
             // "Scene.twist.funscript" -> "twist" -> "R0"
             string axisAlias = SceneScriptIndex.AxisAliasOf(scene, siblingPath);
-            string axisId = FunscriptAxisMap.Resolve(axisAlias, axisAlias);
 
-            if (sibling.Actions is { Count: > 0 }) {
-                lastKeyframeMs = Math.Max(
-                    lastKeyframeMs,
-                    AppendActions(axisId, sibling.Actions, state, state.AxisActions(axisId), trim));
-            }
+            prepared.Add(FunscriptAxisMap.Resolve(axisAlias, axisAlias), sibling.Actions, trim);
         }
 
-        return lastKeyframeMs;
+        return prepared;
     }
 
     /// <summary>
@@ -192,69 +211,64 @@ public sealed class FunscriptMerger
     }
 
     /// <summary>
-    /// Appends one axis' keyframes to the merged timeline at the current scene offset,
-    /// smoothing the seam with the previous scene. Returns the latest timestamp appended,
-    /// relative to the start of this scene.
+    /// Opens a stretch of black in front of the scene about to be appended, long enough for
+    /// every axis to make the trip at no more than the configured speed, and parks each one at
+    /// the halfway position in the middle of it. Returns the gap's length, or zero when none
+    /// was inserted.
     /// </summary>
-    private int AppendActions(
-        string axisId,
-        List<ActionPoint>? actions,
-        MergeState state,
-        List<ActionPoint> target,
-        TrimWindow trim) {
-        if (actions is not { Count: > 0 }) return 0;
+    /// <remarks>
+    /// One keyframe per axis is the whole transition. Every player interpolates between
+    /// points, so the two legs - out of the previous scene's final position over the first
+    /// half of the gap, into the next scene's opening position over the second - draw
+    /// themselves. Further points would only re-specify a line the player already draws.
+    /// <para>
+    /// There is deliberately no anchor keyframe at the seam: the previous scene's own last
+    /// keyframe is already sitting there, and a duplicate of it would say nothing.
+    /// </para>
+    /// </remarks>
+    private int InsertGap(PreparedScene prepared, MergeState state) {
+        // Never in front of the first scene. Nothing has moved yet for the gap to slow down,
+        // and a merge that opens on black reads as a fault rather than as a transition.
+        if (!_options.InsertTransitionGaps || state.Spans.Count == 0) return 0;
 
-        List<ActionPoint> scoped = ApplyTrim(actions, trim);
-        if (scoped.Count == 0) return 0;
+        int gapMs = TransitionGap.DurationMs(
+            state.LastPositions, prepared.FirstPositions, _options.MaxAxisSpeed, _options.TargetFps);
 
+        if (gapMs == 0) return 0;
+
+        int middleMs = state.CurrentOffsetMs + (gapMs / 2);
+
+        foreach (string axisId in TransitionGap.ActiveAxes(state.LastPositions, prepared.FirstPositions)) {
+            state.TargetFor(axisId).Add(
+                new ActionPoint { At = middleMs, Pos = TransitionGap.MidPosition });
+
+            // An axis this scene does not script stays parked here rather than where the last
+            // one left it, and that is what the next seam measures its travel from.
+            state.LastPositions[axisId] = TransitionGap.MidPosition;
+        }
+
+        _logger.Log($"  -> {gapMs}ms transition gap before this scene", LogLevel.Success);
+
+        state.CurrentOffsetMs += gapMs;
+
+        return gapMs;
+    }
+
+    /// <summary>Appends one prepared axis' keyframes at the current scene offset, unaltered.</summary>
+    /// <remarks>
+    /// Nothing is collapsed or dropped here. The seam was smoothed by the gap in front of the
+    /// scene, which bought the device the time it needed; touching the scene's own opening
+    /// keyframes on top of that would throw away motion the script asked for.
+    /// </remarks>
+    private static void Append(SceneTrack track, MergeState state) {
+        List<ActionPoint> target = state.TargetFor(track.AxisId);
         int offsetMs = state.CurrentOffsetMs;
-        int lastKeyframeMs = 0;
 
-        foreach (ActionPoint action in scoped) {
-            lastKeyframeMs = Math.Max(lastKeyframeMs, action.At);
+        foreach (ActionPoint action in track.Actions) {
+            target.Add(new ActionPoint { At = offsetMs + action.At, Pos = action.Pos });
         }
 
-        if (state.LastPositions.TryGetValue(axisId, out int previousPos)) {
-            // Anchor the seam at the previous scene's final position, then collapse every
-            // keyframe inside the transition window down to a single point. Without this the
-            // device would snap from wherever the last scene ended to wherever this one opens.
-            target.Add(new ActionPoint { At = offsetMs, Pos = previousPos });
-
-            int transitionEndMs = Math.Min(_options.TransitionMs, scoped[^1].At);
-            int collapsedPos = -1;
-            bool anyCollapsed = false;
-
-            foreach (ActionPoint action in scoped) {
-                if (action.At < transitionEndMs) {
-                    collapsedPos = action.Pos;
-                    anyCollapsed = true;
-                    continue;
-                }
-
-                if (anyCollapsed) {
-                    if (action.At != transitionEndMs) {
-                        target.Add(new ActionPoint { At = offsetMs + transitionEndMs, Pos = collapsedPos });
-                    }
-                    anyCollapsed = false;
-                }
-
-                target.Add(new ActionPoint { At = offsetMs + action.At, Pos = action.Pos });
-            }
-
-            // Everything in this axis fell inside the transition window.
-            if (anyCollapsed) {
-                target.Add(new ActionPoint { At = offsetMs + transitionEndMs, Pos = collapsedPos });
-            }
-        } else {
-            // First scene on this axis: nothing to transition from.
-            foreach (ActionPoint action in scoped) {
-                target.Add(new ActionPoint { At = offsetMs + action.At, Pos = action.Pos });
-            }
-        }
-
-        state.LastPositions[axisId] = scoped[^1].Pos;
-
-        return lastKeyframeMs;
+        state.LastPositions[track.AxisId] = track.Actions[^1].Pos;
     }
 
     /// <summary>Drops keyframes outside the trim window and rebases the survivors to zero.</summary>
@@ -297,6 +311,65 @@ public sealed class FunscriptMerger
         Type = state.ScriptType
     };
 
+    /// <summary>One axis' keyframes from a single scene, trimmed and rebased to zero.</summary>
+    private sealed record SceneTrack(string AxisId, List<ActionPoint> Actions);
+
+    /// <summary>
+    /// Everything one scene has to contribute, read and trimmed but not yet placed on the
+    /// merged timeline.
+    /// </summary>
+    /// <remarks>
+    /// It exists so the gap in front of a scene can be sized before the scene is committed:
+    /// that needs <see cref="FirstPositions"/>, which is only knowable once every file has
+    /// been read. Holding the result means nothing is read twice.
+    /// </remarks>
+    private sealed class PreparedScene(int? endMs)
+    {
+        private readonly List<SceneTrack> _tracks = [];
+        private readonly Dictionary<string, int> _firstPositions = new(StringComparer.Ordinal);
+
+        public IReadOnlyList<SceneTrack> Tracks => _tracks;
+
+        /// <summary>Keyframes discarded for falling after the end of the scene's video.</summary>
+        public int DroppedPastEnd { get; private set; }
+
+        /// <summary>Where each axis opens, which is what the preceding gap has to reach.</summary>
+        public IReadOnlyDictionary<string, int> FirstPositions => _firstPositions;
+
+        /// <summary>Latest keyframe across every track, relative to the start of the scene.</summary>
+        public int LastKeyframeMs { get; private set; }
+
+        /// <summary>
+        /// Trims one axis onto a zero-based timeline, cuts it at the end of the scene, and keeps
+        /// it in time order, unless nothing survives.
+        /// </summary>
+        /// <remarks>
+        /// Sorted because the input is not required to be, and the merged axis has to be: every
+        /// player assumes it, and so does the retime, which clamps anything out of order.
+        /// Stable, so keyframes sharing a timestamp keep the order the script gave them.
+        /// </remarks>
+        public void Add(string axisId, List<ActionPoint>? actions, TrimWindow trim) {
+            if (actions is not { Count: > 0 }) return;
+
+            List<ActionPoint> scoped = [.. ApplyTrim(actions, trim).OrderBy(action => action.At)];
+
+            if (endMs is int end) {
+                DroppedPastEnd += scoped.RemoveAll(action => action.At > end);
+            }
+
+            if (scoped.Count == 0) return;
+
+            _tracks.Add(new SceneTrack(axisId, scoped));
+
+            // First writer wins, for a scene that supplies one axis twice - embedded in the
+            // main script and again as a sibling file. The two are appended in that order, so
+            // the embedded one is what the seam actually has to arrive at.
+            _firstPositions.TryAdd(axisId, scoped[0].Pos);
+
+            LastKeyframeMs = Math.Max(LastKeyframeMs, scoped[^1].At);
+        }
+    }
+
     /// <summary>Accumulator carried across scenes for the duration of one merge.</summary>
     private sealed class MergeState
     {
@@ -310,13 +383,25 @@ public sealed class FunscriptMerger
         /// <summary>Descriptive metadata unioned across every input read so far.</summary>
         public MetadataAccumulator Metadata { get; } = new();
 
-        /// <summary>Final position per axis, used to smooth the seam into the next scene.</summary>
+        /// <summary>
+        /// Where each axis was left, which is what the next seam measures its travel from. A
+        /// gap parks every axis it covers at the halfway position, so this is not always the
+        /// last position some scene scripted.
+        /// </summary>
         public Dictionary<string, int> LastPositions { get; } = [];
 
         /// <summary>Start of the scene currently being merged, in milliseconds.</summary>
         public int CurrentOffsetMs { get; set; }
 
         public string ScriptType { get; set; } = BasicScriptType;
+
+        /// <summary>
+        /// Where keyframes for <paramref name="axisId"/> go, treating the stroke axis like any
+        /// other so a caller walking a scene's axes does not have to special-case it. L0 lives
+        /// at the document root rather than in the axis list.
+        /// </summary>
+        public List<ActionPoint> TargetFor(string axisId) =>
+            axisId == FunscriptAxisMap.RootAxisId ? RootActions : AxisActions(axisId);
 
         public List<ActionPoint> AxisActions(string axisId) {
             if (!AuxAxes.TryGetValue(axisId, out List<ActionPoint>? actions)) {

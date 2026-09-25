@@ -29,6 +29,23 @@ public class FFmpegArgumentsTests
         Assert.Single(args, argument => argument == Segment);
     }
 
+    /// <remarks>
+    /// A segment whose audio is shorter than its video leaves a hole in the concatenated
+    /// audio, which players close by playing later audio early - drift that grows with every
+    /// scene. Padding and then cutting at the shortest stream keeps each segment's two
+    /// streams the same length.
+    /// </remarks>
+    [Theory]
+    [MemberData(nameof(EncoderMatrix))]
+    public void The_encode_pads_audio_to_the_video_length(bool useAv1, bool useNvenc) {
+        List<string> args = FFmpegArguments.BuildEncode(Input, Segment, Trim(1, 5), Options(useAv1, useNvenc));
+
+        int filter = args.IndexOf("-af");
+        Assert.Contains("apad", args[filter + 1]);
+        Assert.Contains("first_pts=0", args[filter + 1]);
+        Assert.InRange(args.IndexOf("-shortest"), 0, args.IndexOf(Segment) - 1);
+    }
+
     [Theory]
     [MemberData(nameof(EncoderMatrix))]
     public void The_concat_command_ends_at_its_output(bool useAv1, bool useNvenc) {
@@ -204,6 +221,105 @@ public class FFmpegArgumentsTests
         Assert.Equal("6", args[args.IndexOf("-ac") + 1]);
         Assert.Equal("44100", args[args.IndexOf("-ar") + 1]);
         Assert.Contains(args, argument => argument.Contains("scale=3840:2160", StringComparison.Ordinal));
+    }
+
+    /// <remarks>
+    /// The generated black is stream-copied into the output alongside the real segments, so
+    /// anything about it that differs - encoder, container, frame rate, audio layout - would
+    /// make the concat refuse it or produce a broken file.
+    /// </remarks>
+    [Theory]
+    [MemberData(nameof(EncoderMatrix))]
+    public void A_black_segment_is_encoded_exactly_like_a_real_one(bool useAv1, bool useNvenc) {
+        MergeOptions options = Options(useAv1, useNvenc);
+
+        List<string> encode = FFmpegArguments.BuildEncode(Input, Segment, trim: null, options);
+        List<string> black = FFmpegArguments.BuildBlackSegment(Segment, 800, options);
+
+        Assert.Equal(encode[encode.IndexOf("-c:v") + 1], black[black.IndexOf("-c:v") + 1]);
+        Assert.Equal(encode[encode.IndexOf("-r") + 1], black[black.IndexOf("-r") + 1]);
+        Assert.Equal(encode[encode.IndexOf("-f") + 1], black[black.LastIndexOf("-f") + 1]);
+        Assert.Equal(encode.Contains("h264_mp4toannexb"), black.Contains("h264_mp4toannexb"));
+        Assert.Equal(encode[encode.IndexOf("-c:a") + 1], black[black.IndexOf("-c:a") + 1]);
+    }
+
+    [Theory]
+    [MemberData(nameof(EncoderMatrix))]
+    public void The_black_segment_command_ends_at_its_output(bool useAv1, bool useNvenc) {
+        List<string> args = FFmpegArguments.BuildBlackSegment(Segment, 800, Options(useAv1, useNvenc));
+
+        Assert.Equal(Segment, args[^1]);
+        Assert.Single(args, argument => argument == Segment);
+    }
+
+    /// <remarks>
+    /// Both lavfi sources run forever, so the length has to be imposed on the output or ffmpeg
+    /// never stops.
+    /// </remarks>
+    [Fact]
+    public void The_black_segment_is_generated_from_lavfi_and_bounded_by_its_duration() {
+        List<string> args = FFmpegArguments.BuildBlackSegment(Segment, 800, Options(true, true));
+
+        Assert.Equal(2, args.Count(argument => argument == "lavfi"));
+        Assert.Contains(args, argument => argument.StartsWith("color=c=black", StringComparison.Ordinal));
+        Assert.Contains(args, argument => argument.StartsWith("anullsrc=", StringComparison.Ordinal));
+        Assert.Equal("0.8", args[args.IndexOf("-t") + 1]);
+    }
+
+    /// <remarks>
+    /// scale= wants W:H and color= wants WxH. One stored setting, two spellings - and handing
+    /// color= the colon form makes ffmpeg reject the whole filter.
+    /// </remarks>
+    [Fact]
+    public void The_black_frame_size_is_written_the_way_the_color_source_wants_it() {
+        var options = new MergeOptions { TargetResolution = "3840:2160", TargetFps = 30 };
+
+        List<string> args = FFmpegArguments.BuildBlackSegment(Segment, 500, options);
+
+        Assert.Contains("color=c=black:s=3840x2160:r=30", args);
+        Assert.DoesNotContain(args, argument => argument.Contains("s=3840:2160", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void The_configured_audio_layout_reaches_the_black_segment() {
+        var options = new MergeOptions { AudioChannels = 6, AudioSampleRate = 44100, AudioBitrate = "320k" };
+
+        List<string> args = FFmpegArguments.BuildBlackSegment(Segment, 500, options);
+
+        Assert.Contains("anullsrc=channel_layout=6c:sample_rate=44100", args);
+        Assert.Equal("6", args[args.IndexOf("-ac") + 1]);
+        Assert.Equal("44100", args[args.IndexOf("-ar") + 1]);
+        Assert.Equal("320k", args[args.IndexOf("-b:a") + 1]);
+    }
+
+    /// <remarks>
+    /// -hwaccel is a decode hint and there is nothing here to decode; the frames come from
+    /// lavfi. The encoder itself is still whichever one the options select.
+    /// </remarks>
+    [Fact]
+    public void A_black_segment_asks_for_no_hardware_decode() {
+        List<string> args = FFmpegArguments.BuildBlackSegment(Segment, 800, Options(true, true));
+
+        Assert.DoesNotContain("-hwaccel", args);
+        Assert.Equal("av1_nvenc", args[args.IndexOf("-c:v") + 1]);
+    }
+
+    [Fact]
+    public void A_black_segment_hand_quotes_nothing_either() {
+        List<string> args = FFmpegArguments.BuildBlackSegment(Segment, 800, Options(true, true));
+
+        Assert.All(args, argument => Assert.False(argument.StartsWith('"') || argument.EndsWith('"')));
+    }
+
+    /// <remarks>
+    /// A locale using a comma for the decimal point would otherwise produce a duration ffmpeg
+    /// cannot parse.
+    /// </remarks>
+    [Fact]
+    public void The_black_duration_is_written_with_an_invariant_decimal_point() {
+        List<string> args = FFmpegArguments.BuildBlackSegment(Segment, 1250, Options(true, true));
+
+        Assert.Equal("1.25", args[args.IndexOf("-t") + 1]);
     }
 
     private static MergeOptions Options(bool useAv1, bool useNvenc) =>

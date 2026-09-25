@@ -40,6 +40,8 @@ public sealed partial class OptionsForm
     private readonly TextBox _txtFfmpegPath = NewTextBox();
     private readonly TextBox _txtFfprobePath = NewTextBox();
 
+    private readonly CheckBox _chkIncludeSubfolders = NewCheckBox("Include subfolders of the input folder");
+
     /// <summary>Where the result of a "Test" click is reported, instead of a message box.</summary>
     /// <remarks>
     /// A row in the grid rather than a docked strip: the page scrolls, and a bottom-docked
@@ -72,9 +74,10 @@ public sealed partial class OptionsForm
     // --- Merge and script ---
 
     private readonly TextBox _txtOutputName = NewTextBox();
-    private readonly NumericUpDown _numTransitionMs = NewNumeric(0, 10000, increment: 50);
+    private readonly NumericUpDown _numMaxAxisSpeed = NewNumeric(10, 1000, increment: 10);
     private readonly TextBox _txtVideoExtensions = NewTextBox();
 
+    private readonly CheckBox _chkTransitionGaps = NewCheckBox("Add black frames between scenes");
     private readonly CheckBox _chkSkipUnscripted = NewCheckBox("Skip videos with no funscript");
 
     // --- Application ---
@@ -180,6 +183,12 @@ public sealed partial class OptionsForm
         TableLayoutPanel grid = NewGrid();
 
         AddRow(grid, "Input folder:", _txtInputFolder, BrowseFolderButton(_txtInputFolder));
+        AddCheckRow(grid, _chkIncludeSubfolders);
+        AddHint(grid,
+            "Scans every folder beneath the input folder as well. Scenes are still matched by "
+            + "filename rather than by folder, and a name found in two folders is reported in "
+            + "the log. The temp and output folders are left out of the scan.");
+
         AddRow(grid, "Temp folder:", _txtTempFolder, BrowseFolderButton(_txtTempFolder));
         AddRow(grid, "Output folder:", _txtOutputFolder, BrowseFolderButton(_txtOutputFolder));
         AddHint(grid, "Leave the output folder blank to write beside the application.");
@@ -236,10 +245,15 @@ public sealed partial class OptionsForm
         AddRow(grid, "Default output name:", _txtOutputName);
         AddHint(grid, "What the main window starts with. No extension and no axis name.");
 
-        AddRow(grid, "Scene transition (ms):", _numTransitionMs);
+        AddCheckRow(grid, _chkTransitionGaps);
         AddHint(grid,
-            "Keyframes inside this window at the start of a scene collapse to one, so the device "
-            + "eases out of the previous scene instead of snapping. 0 disables it.");
+            "Each scene is preceded by black, long enough for every axis to reach the position "
+            + "the next scene opens at. Without it the device is asked to get there instantly.");
+
+        AddRow(grid, "Max axis speed (units/sec):", _numMaxAxisSpeed);
+        AddHint(grid,
+            "How fast an axis may travel across a seam, in position units per second. Lower is "
+            + "gentler and makes the black longer; at 100 a full-range move takes one second.");
 
         AddCheckRow(grid, _chkSkipUnscripted);
         AddHint(grid,
@@ -437,6 +451,7 @@ public sealed partial class OptionsForm
 
     private void ConfigureToolTips() {
         _toolTip.SetToolTip(_txtInputFolder, "The folder scanned for source videos and funscripts.");
+        _toolTip.SetToolTip(_chkIncludeSubfolders, "Scans the input folder and every folder underneath it, instead of its top level only. A video is paired with the funscript of its own name wherever that sits, so files with the same name in different folders are reported as ambiguous.");
         _toolTip.SetToolTip(_txtTempFolder, "Where the normalized per-video segments are written before they are joined.");
         _toolTip.SetToolTip(_txtOutputFolder, "Where the merged video and funscript are written. Blank means beside the application.");
         _toolTip.SetToolTip(_txtConcatListFile, "Scratch file listing the segments in concat order. Deleted when the run ends, whether it succeeded or not.");
@@ -459,7 +474,8 @@ public sealed partial class OptionsForm
         _toolTip.SetToolTip(_numAudioSampleRate, "Sample rate every segment's audio is resampled to. Mismatched rates break the concat.");
 
         _toolTip.SetToolTip(_txtOutputName, "The base filename the main window starts with. Do not include extensions or axis names.");
-        _toolTip.SetToolTip(_numTransitionMs, "How long the eased seam at the start of each scene lasts. Keyframes inside it collapse to a single point.");
+        _toolTip.SetToolTip(_chkTransitionGaps, "Generates a stretch of black before each scene and gives the merged script that time too, so no axis has to jump to where the next scene starts.");
+        _toolTip.SetToolTip(_numMaxAxisSpeed, "The speed limit that sizes each gap, in position units per second. Every axis parks halfway through, so the longest single move decides how much black is needed.");
         _toolTip.SetToolTip(_txtVideoExtensions, "Comma separated list of the file extensions treated as input videos, for example .mp4, .mkv.");
 
         _toolTip.SetToolTip(_chkSkipUnscripted, "Leaves a video out of the merge when no funscript shares its name. Each one that is skipped is named in the log. Unchecked, it is merged and plays unscripted.");

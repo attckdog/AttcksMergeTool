@@ -25,7 +25,8 @@ public class SettingsStoreTests
             TargetResolution = "3840:2160",
             Av1Quality = 24,
             X264Preset = "slow",
-            TransitionMs = 250,
+            InsertTransitionGaps = false,
+            MaxAxisSpeed = 250,
             VideoExtensions = [".mp4", ".mkv"],
             LogFontSize = 12F,
             WindowWidth = 1200,
@@ -44,7 +45,8 @@ public class SettingsStoreTests
         Assert.Equal("3840:2160", loaded.TargetResolution);
         Assert.Equal(24, loaded.Av1Quality);
         Assert.Equal("slow", loaded.X264Preset);
-        Assert.Equal(250, loaded.TransitionMs);
+        Assert.False(loaded.InsertTransitionGaps);
+        Assert.Equal(250, loaded.MaxAxisSpeed);
         Assert.Equal([".mp4", ".mkv"], loaded.VideoExtensions);
         Assert.Equal(12F, loaded.LogFontSize);
         Assert.Equal(1200, loaded.WindowWidth);

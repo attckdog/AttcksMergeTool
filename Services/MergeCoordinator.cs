@@ -67,9 +67,17 @@ public sealed class MergeCoordinator
             return false;
         }
 
-        List<SceneScripts> scenes = SceneScriptIndex.Build(_options.InputFolder, _options.VideoExtensions);
-        List<string> videoFiles = InConfiguredOrder(
-            MediaFileScanner.FindVideos(_options.InputFolder, _options.VideoExtensions));
+        // Scanned here rather than inside SceneScriptIndex.Build(folder) so both listings come
+        // from one walk of the folder, and so the ambiguity check below can see both of them.
+        InputScan scan = _options.InputScan;
+        List<string> scriptFiles = MediaFileScanner.FindFunscripts(_options.InputFolder, scan);
+        List<string> scannedVideos = MediaFileScanner.FindVideos(
+            _options.InputFolder, _options.VideoExtensions, scan);
+
+        ReportAmbiguousNames(scannedVideos, scriptFiles);
+
+        List<SceneScripts> scenes = SceneScriptIndex.Build(scriptFiles, scannedVideos);
+        List<string> videoFiles = InConfiguredOrder(scannedVideos);
 
         if (scenes.Count == 0 && videoFiles.Count == 0) {
             _logger.Log(
@@ -118,6 +126,24 @@ public sealed class MergeCoordinator
 
         _logger.Log($"{Environment.NewLine}All operations complete!", LogLevel.Heading);
         return true;
+    }
+
+    /// <summary>
+    /// Warns when the scan turned up one base name in more than one folder, which is the one
+    /// ambiguity a recursive walk introduces: a scene is identified by filename, so two files
+    /// of a name in different folders are read as the same scene.
+    /// </summary>
+    /// <remarks>
+    /// Only for a recursive scan. A single folder holding both "Scene.mp4" and "Scene.mkv" is
+    /// the same collision, but it is one the tool has always had and not one this option would
+    /// be explaining.
+    /// </remarks>
+    private void ReportAmbiguousNames(IReadOnlyList<string> videoFiles, IReadOnlyList<string> scriptFiles) {
+        if (!_options.IncludeInputSubfolders) return;
+
+        if (MediaFileScanner.AmbiguousNameWarning(videoFiles, scriptFiles) is { } warning) {
+            _logger.Log($"  -> {warning}", LogLevel.Warning);
+        }
     }
 
     /// <summary>

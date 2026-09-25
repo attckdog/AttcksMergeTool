@@ -107,4 +107,24 @@ internal static class MergeResults
 
         return new FunscriptMergeResult(document, spans, totalDurationMs);
     }
+
+    /// <summary>
+    /// A result whose scenes each run <paramref name="sceneMs"/> long and are separated by
+    /// <paramref name="gapMs"/> of black, which is what the video stage reads lead-ins out of.
+    /// </summary>
+    public static FunscriptMergeResult WithGaps(int sceneMs, int gapMs, params string[] names) {
+        var spans = new List<SceneSpan>(names.Length);
+        int startMs = 0;
+
+        for (int i = 0; i < names.Length; i++) {
+            // No lead-in in front of the first scene, matching what the merger emits.
+            int leadInMs = i == 0 ? 0 : gapMs;
+
+            startMs += leadInMs;
+            spans.Add(new SceneSpan(names[i], startMs, sceneMs, leadInMs));
+            startMs += sceneMs;
+        }
+
+        return new FunscriptMergeResult(new Funscript { Actions = [] }, spans, startMs);
+    }
 }

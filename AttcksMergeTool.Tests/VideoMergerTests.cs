@@ -92,6 +92,105 @@ public class VideoMergerTests
         Assert.Equal([2048, 5120], segments.Select(segment => segment.DurationMs));
     }
 
+    /// <remarks>
+    /// The lengths come from the script merge rather than being worked out again here, because
+    /// the merged script has already placed its keyframes inside them.
+    /// </remarks>
+    [Fact]
+    public async Task A_gap_is_generated_in_front_of_every_scene_the_script_left_room_for() {
+        using var workspace = new TempWorkspace();
+        MergeOptions options = workspace.Options(
+            nameof(A_gap_is_generated_in_front_of_every_scene_the_script_left_room_for));
+
+        var runner = new FakeProcessRunner();
+
+        IReadOnlyList<EncodedSegment> segments = await Merge(
+            workspace, options, runner, Probe(2000, 1000, 5000, 1000, 3000), ["A.mp4", "B.mp4", "C.mp4"],
+            MergeResults.WithGaps(sceneMs: 2000, gapMs: 1000, "A", "B", "C"));
+
+        // Scene, gap, scene, gap, scene - and the gaps are not scenes.
+        Assert.Equal([false, true, false, true, false], segments.Select(segment => segment.IsGap));
+        Assert.Equal(["A", "B", "B", "C", "C"], segments.Select(segment => segment.SceneName));
+
+        // Numbered by position in the plan rather than by the order the parallel encodes
+        // happened to start in, so the concat order is the plan order.
+        Assert.Equal(
+            ["0001.mkv", "0002.mkv", "0003.mkv", "0004.mkv", "0005.mkv"],
+            segments.Select(segment => Path.GetFileName(segment.SegmentPath)));
+
+        // The two gaps are the two lavfi invocations, and each asked for the planned length.
+        List<string[]> black = [
+            .. runner.Invocations
+                .Select(invocation => invocation.Arguments.ToArray())
+                .Where(arguments => arguments.Contains("lavfi"))
+        ];
+
+        Assert.Equal(2, black.Count);
+        Assert.All(black, arguments => Assert.Equal("1", arguments[Array.IndexOf(arguments, "-t") + 1]));
+    }
+
+    /// <remarks>
+    /// Read while the concat is running, because the list file is a scratch file the merge
+    /// deletes on its way out.
+    /// </remarks>
+    [Fact]
+    public async Task The_generated_gaps_take_their_place_in_the_concat_list() {
+        using var workspace = new TempWorkspace();
+        MergeOptions options = workspace.Options(nameof(The_generated_gaps_take_their_place_in_the_concat_list));
+
+        string[] listed = [];
+
+        var runner = new FakeProcessRunner {
+            Respond = invocation => {
+                if (invocation.Arguments.Contains("concat")) listed = File.ReadAllLines(options.ConcatListFile);
+                return string.Empty;
+            }
+        };
+
+        await Merge(
+            workspace, options, runner, Probe(2000, 1000, 5000), ["A.mp4", "B.mp4"],
+            MergeResults.WithGaps(sceneMs: 2000, gapMs: 1000, "A", "B"));
+
+        // The gap is the middle line: it is concatenated as a segment like any other.
+        Assert.Equal(
+            ["0001.mkv", "0002.mkv", "0003.mkv"],
+            listed.Select(line => Path.GetFileName(line.TrimEnd('\'')).Trim()));
+    }
+
+    /// <remarks>
+    /// There are no axes to move, so there is nothing for a gap to buy time for.
+    /// </remarks>
+    [Fact]
+    public async Task A_run_with_no_script_gets_no_gaps() {
+        using var workspace = new TempWorkspace();
+        MergeOptions options = workspace.Options(nameof(A_run_with_no_script_gets_no_gaps));
+
+        IReadOnlyList<EncodedSegment> segments = await Merge(
+            workspace, options, new FakeProcessRunner(), Probe(2000, 5000), ["A.mp4", "B.mp4"]);
+
+        Assert.All(segments, segment => Assert.False(segment.IsGap));
+    }
+
+    /// <remarks>
+    /// Lead-ins are read out of the spans by position, so a list that does not line up is not
+    /// one they can be trusted from. Better a merge with no gaps than one whose black lands in
+    /// the wrong places.
+    /// </remarks>
+    [Fact]
+    public async Task Spans_that_do_not_line_up_with_the_videos_are_not_read_for_lead_ins() {
+        using var workspace = new TempWorkspace();
+        MergeOptions options = workspace.Options(nameof(Spans_that_do_not_line_up_with_the_videos_are_not_read_for_lead_ins));
+        var logger = new FakeJobLogger();
+
+        IReadOnlyList<EncodedSegment> segments = await Merge(
+            workspace, options, new FakeProcessRunner(), Probe(2000, 5000), ["A.mp4", "B.mp4"],
+            MergeResults.WithGaps(sceneMs: 2000, gapMs: 1000, "A", "B", "C"),
+            logger);
+
+        Assert.All(segments, segment => Assert.False(segment.IsGap));
+        Assert.True(logger.WarnedAbout("no transition gaps"));
+    }
+
     [Fact]
     public async Task A_successful_run_clears_its_scratch_files() {
         using var workspace = new TempWorkspace();

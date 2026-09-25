@@ -32,6 +32,17 @@ internal sealed class TempWorkspace : IDisposable
     public string Path(string relativeName) => System.IO.Path.Combine(Root, relativeName);
 
     /// <summary>
+    /// The full path for <paramref name="relativeName"/> with its folder created, so a fixture
+    /// can name a file in a subfolder - "Scenes/One.mp4" - without setting the folder up first.
+    /// </summary>
+    private string PreparedPath(string relativeName) {
+        string path = Path(relativeName);
+        Directory.CreateDirectory(System.IO.Path.GetDirectoryName(path) ?? Root);
+
+        return path;
+    }
+
+    /// <summary>
     /// Options pointing every configurable path, the outputs included, at this workspace, so
     /// nothing a test writes escapes <see cref="Root"/> or collides with another test.
     /// </summary>
@@ -43,8 +54,23 @@ internal sealed class TempWorkspace : IDisposable
     /// Leaves a video with no funscript out of the merge. Off unless a test is about that,
     /// matching <see cref="MergeOptions.SkipVideosWithoutScripts"/>.
     /// </param>
+    /// <param name="includeInputSubfolders">
+    /// Walks every folder under the workspace rather than its top level only. Off unless a
+    /// test is about that, matching <see cref="MergeOptions.IncludeInputSubfolders"/>.
+    /// </param>
+    /// <param name="insertTransitionGaps">
+    /// Puts black between scenes. Off unless a test is about that, which is the opposite of
+    /// <see cref="MergeOptions.InsertTransitionGaps"/> and deliberate: a gap moves every offset
+    /// after it, so leaving it on would make each of the timeline-arithmetic tests assert two
+    /// things at once and stop saying clearly which one broke.
+    /// </param>
     public MergeOptions Options(
-        string outputName, string? ffmpegPath = null, bool skipUnscriptedVideos = false) => new() {
+        string outputName,
+        string? ffmpegPath = null,
+        bool skipUnscriptedVideos = false,
+        bool insertTransitionGaps = false,
+        bool includeInputSubfolders = false,
+        int maxAxisSpeed = 100) => new() {
         OutputName = outputName,
         InputFolder = Root,
         OutputFolder = Root,
@@ -52,12 +78,15 @@ internal sealed class TempWorkspace : IDisposable
         ConcatListFile = Path("filelist.txt"),
         ChapterMetadataFile = Path("ffmetadata.txt"),
         FfmpegPath = ffmpegPath ?? AppSettings.DefaultFfmpegPath,
-        SkipVideosWithoutScripts = skipUnscriptedVideos
+        SkipVideosWithoutScripts = skipUnscriptedVideos,
+        IncludeInputSubfolders = includeInputSubfolders,
+        InsertTransitionGaps = insertTransitionGaps,
+        MaxAxisSpeed = maxAxisSpeed
     };
 
     /// <summary>Writes a funscript and returns its path.</summary>
     public string WriteScript(string fileName, Funscript script) {
-        string path = Path(fileName);
+        string path = PreparedPath(fileName);
         File.WriteAllText(path, JsonSerializer.Serialize(script, ScriptOptions), new UTF8Encoding(false));
         return path;
     }
@@ -67,7 +96,7 @@ internal sealed class TempWorkspace : IDisposable
     /// <see cref="FakeMediaProbe"/>; only the name does.
     /// </summary>
     public string WriteVideo(string fileName) {
-        string path = Path(fileName);
+        string path = PreparedPath(fileName);
         File.WriteAllText(path, "not really a video");
         return path;
     }

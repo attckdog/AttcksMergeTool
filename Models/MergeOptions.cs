@@ -119,10 +119,38 @@ public sealed class MergeOptions
     public IReadOnlyList<string> VideoExtensions { get; init; } = MediaFileScanner.VideoExtensions;
 
     /// <summary>
-    /// Window at the head of each scene over which keyframes are collapsed, so the
-    /// device eases from the previous scene's final position instead of snapping.
+    /// Scan every folder under <see cref="InputFolder"/>, not just its top level.
     /// </summary>
-    public int TransitionMs { get; init; } = 500;
+    /// <remarks>
+    /// Off here, where the default is what the code did before the option existed. Use
+    /// <see cref="InputScan"/> rather than this flag to do any scanning: it also carries the
+    /// folders that have to stay out of a recursive walk.
+    /// </remarks>
+    public bool IncludeInputSubfolders { get; init; }
+
+    /// <summary>
+    /// How this job walks its input folder, with the folders it writes into kept out of the
+    /// walk - both are resolved paths by now, so a temp or output folder sitting inside the
+    /// input tree is recognised as one and skipped.
+    /// </summary>
+    public InputScan InputScan => new(IncludeInputSubfolders, [TempFolder, OutputFolder]);
+
+    /// <summary>
+    /// Insert a stretch of black between scenes, long enough for every axis to reach the
+    /// position the next scene opens at without exceeding <see cref="MaxAxisSpeed"/>.
+    /// </summary>
+    /// <remarks>
+    /// On here as well as in <see cref="AppSettings"/>, unlike the rest of this file: a merge
+    /// that joins scenes with no gap at all is what the smoothing exists to stop, so it is not
+    /// a default worth preserving. <see cref="Services.TransitionGap"/> sizes each one.
+    /// </remarks>
+    public bool InsertTransitionGaps { get; init; } = true;
+
+    /// <summary>
+    /// Ceiling on axis travel across a scene seam, in position units per second. It is what
+    /// sizes the black gap: the slower the limit, the longer the gap has to be.
+    /// </summary>
+    public int MaxAxisSpeed { get; init; } = 100;
 
     public string OutputScriptPath => Path.Combine(OutputFolder, OutputName + ".funscript");
     public string OutputVideoPath => Path.Combine(OutputFolder, OutputName + ".mp4");
@@ -154,7 +182,9 @@ public sealed class MergeOptions
         AudioChannels = settings.AudioChannels,
         AudioSampleRate = settings.AudioSampleRate,
         VideoExtensions = [.. settings.VideoExtensions],
-        TransitionMs = settings.TransitionMs,
+        IncludeInputSubfolders = settings.IncludeInputSubfolders,
+        InsertTransitionGaps = settings.InsertTransitionGaps,
+        MaxAxisSpeed = settings.MaxAxisSpeed,
         SkipVideosWithoutScripts = settings.SkipVideosWithoutScripts
     };
 

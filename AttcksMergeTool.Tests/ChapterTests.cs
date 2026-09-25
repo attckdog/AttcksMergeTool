@@ -49,6 +49,61 @@ public class ChapterBuilderTests
             ChapterBuilder.FromBookmarks(result));
     }
 
+    /// <remarks>
+    /// A gap is black rather than content, so a chapter of its own would be a navigation target
+    /// that shows nothing. Folding it into the chapter before it also keeps every scene's
+    /// chapter starting on its first real frame.
+    /// </remarks>
+    [Fact]
+    public void A_gap_extends_the_chapter_before_it_rather_than_starting_one() {
+        IReadOnlyList<Chapter> chapters = ChapterBuilder.FromSegments([
+            Segment("A.mp4", 2000),
+            Gap("B.mp4", 1000),
+            Segment("B.mp4", 5000)
+        ]);
+
+        Assert.Equal([new Chapter("A", 0, 3000), new Chapter("B", 3000, 8000)], chapters);
+    }
+
+    /// <remarks>
+    /// The chapters have to describe the whole file, so the time the gaps take still has to be
+    /// somewhere - they just do not get a title of their own.
+    /// </remarks>
+    [Fact]
+    public void Gaps_keep_the_chapters_contiguous_and_covering_the_whole_output() {
+        EncodedSegment[] segments = [
+            Segment("A.mp4", 2000),
+            Gap("B.mp4", 1000),
+            Segment("B.mp4", 5000),
+            Gap("C.mp4", 800),
+            Segment("C.mp4", 3000)
+        ];
+
+        IReadOnlyList<Chapter> chapters = ChapterBuilder.FromSegments(segments);
+
+        Assert.Equal(3, chapters.Count);
+        Assert.Equal(0, chapters[0].StartMs);
+        Assert.Equal(
+            segments.Sum(segment => segment.DurationMs!.Value), ChapterBuilder.TotalDurationMs(chapters));
+
+        // No hole and no overlap: each chapter picks up exactly where the last one left off.
+        Assert.All(chapters.Zip(chapters.Skip(1)), pair => Assert.Equal(pair.First.EndMs, pair.Second.StartMs));
+    }
+
+    /// <remarks>
+    /// The merger never emits one - there is nothing to ease out of before the first scene -
+    /// but if it ever did, the black must not take the first scene's title with it.
+    /// </remarks>
+    [Fact]
+    public void A_leading_gap_belongs_to_no_chapter() {
+        IReadOnlyList<Chapter> chapters = ChapterBuilder.FromSegments([
+            Gap("A.mp4", 500),
+            Segment("A.mp4", 2000)
+        ]);
+
+        Assert.Equal([new Chapter("A", 500, 2500)], chapters);
+    }
+
     [Fact]
     public void Total_duration_is_where_the_last_chapter_ends() {
         Assert.Equal(0, ChapterBuilder.TotalDurationMs([]));
@@ -57,6 +112,10 @@ public class ChapterBuilderTests
 
     private static EncodedSegment Segment(string sourceName, int? durationMs) =>
         new(Path.Combine(@"C:\in", sourceName), Path.Combine(@"C:\temp", "0001.mkv"), durationMs);
+
+    /// <summary>Black in front of <paramref name="followingSourceName"/>.</summary>
+    private static EncodedSegment Gap(string followingSourceName, int? durationMs) =>
+        Segment(followingSourceName, durationMs) with { IsGap = true };
 
     private static Bookmark Mark(string name, int timeMs) => new() { Name = name, Time = timeMs };
 }

@@ -119,6 +119,79 @@ public class ScriptRetimerTests
         Assert.Contains("Elsewhere", result.Reason);
     }
 
+    /// <remarks>
+    /// A gap is not a scene. It takes up real time in the output, so everything after it moves
+    /// by its length - but there is no span for it to be corrected against.
+    /// </remarks>
+    [Fact]
+    public void A_gap_moves_everything_after_it_without_claiming_a_scene() {
+        Funscript document = Document(Actions((0, 0), (1000, 100), (2500, 50), (3000, 0)), Marks(("A", 0), ("B", 3000)));
+
+        ScriptRetimer.Result result = ScriptRetimer.Retime(
+            document,
+            [new SceneSpan("A", 0, 2000), new SceneSpan("B", 3000, 5000, LeadInMs: 1000)],
+            [Segment("A.mp4", 2048), Gap("B.mp4", 1000), Segment("B.mp4", 5120)]);
+
+        Assert.True(result.Applied);
+        Assert.Equal(8168, result.TotalDurationMs);
+
+        // B starts at 2048 + 1000 rather than at 3000, so it and its lead-in both move by 48ms.
+        Assert.Equal([0, 1000, 2548, 3048], document.Actions!.Select(action => action.At));
+        Assert.Equal([0, 3048], document.Bookmarks!.Select(bookmark => bookmark.Time));
+    }
+
+    /// <remarks>
+    /// The keyframes inside a gap are steering towards what the next scene opens at, so they
+    /// belong to that scene. Given the previous one's correction instead, a gap keyframe could
+    /// land after the scene it was supposed to lead into.
+    /// </remarks>
+    [Fact]
+    public void A_keyframe_inside_a_gap_takes_the_following_scenes_correction() {
+        Funscript document = Document(Actions((0, 0), (2500, 50), (3000, 0)), Marks(("A", 0), ("B", 3000)));
+
+        // A's segment comes out 500ms shorter than planned, so B is pulled back by 500.
+        ScriptRetimer.Result result = ScriptRetimer.Retime(
+            document,
+            [new SceneSpan("A", 0, 2000), new SceneSpan("B", 3000, 1000, LeadInMs: 1000)],
+            [Segment("A.mp4", 1500), Gap("B.mp4", 1000), Segment("B.mp4", 1000)]);
+
+        Assert.True(result.Applied);
+
+        // The gap keyframe moves with B, staying halfway through the black rather than being
+        // left behind at the tail of A.
+        Assert.Equal([0, 2000, 2500], document.Actions!.Select(action => action.At));
+    }
+
+    /// <remarks>
+    /// Counting the gaps as scenes would make every gapped merge look like a mismatch and
+    /// refuse a retime that is perfectly sound.
+    /// </remarks>
+    [Fact]
+    public void Only_the_scene_segments_are_counted_when_checking_the_two_lists_agree() {
+        Funscript document = Document(Actions((0, 0)), Marks(("A", 0)));
+
+        ScriptRetimer.Result mismatch = ScriptRetimer.Retime(
+            document,
+            [new SceneSpan("A", 0, 2000)],
+            [Segment("A.mp4", 2048), Gap("B.mp4", 500), Segment("B.mp4", 1000)]);
+
+        Assert.False(mismatch.Applied);
+        Assert.Contains("built from 2", mismatch.Reason);
+    }
+
+    [Fact]
+    public void An_unmeasurable_gap_stops_the_retime_like_any_other_segment() {
+        Funscript document = Document(Actions((0, 0)), Marks(("A", 0), ("B", 3000)));
+
+        ScriptRetimer.Result result = ScriptRetimer.Retime(
+            document,
+            [new SceneSpan("A", 0, 2000), new SceneSpan("B", 3000, 1000, LeadInMs: 1000)],
+            [Segment("A.mp4", 2048), Gap("B.mp4", null), Segment("B.mp4", 1000)]);
+
+        Assert.False(result.Applied);
+        Assert.Contains("segment 2", result.Reason);
+    }
+
     [Fact]
     public void Nothing_to_retime_is_reported_rather_than_applied() {
         Assert.False(ScriptRetimer.Retime(Document([], []), [], []).Applied);
@@ -140,4 +213,8 @@ public class ScriptRetimerTests
 
     private static EncodedSegment Segment(string sourceName, int? durationMs) =>
         new(Path.Combine(@"C:\in", sourceName), Path.Combine(@"C:\temp", "0001.mkv"), durationMs);
+
+    /// <summary>Black in front of <paramref name="followingSourceName"/>.</summary>
+    private static EncodedSegment Gap(string followingSourceName, int? durationMs) =>
+        Segment(followingSourceName, durationMs) with { IsGap = true };
 }

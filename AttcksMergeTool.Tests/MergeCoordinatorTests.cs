@@ -103,6 +103,85 @@ public class MergeCoordinatorTests
     }
 
     /// <remarks>
+    /// The whole feature, end to end: the script merge sizes a gap, the video merge generates
+    /// black of that length, and the retime moves the script onto what the encode measured -
+    /// gaps included. If any of the three disagreed about the gap the script would drift from
+    /// the video by its length, and this is the only test that would notice.
+    /// </remarks>
+    [Fact]
+    public async Task A_gapped_merge_keeps_the_script_and_the_video_on_the_same_timeline() {
+        using var workspace = new TempWorkspace();
+        workspace.WriteScript("A.funscript", ScriptBuilder.Basic((0, 0), (1000, 100)));
+        workspace.WriteScript("B.funscript", ScriptBuilder.Basic((0, 0), (500, 50)));
+        workspace.WriteVideo("A.mp4");
+        workspace.WriteVideo("B.mp4");
+
+        // A ends at 100 and B opens at 0, so the outbound leg is 50 units - a 1000ms gap at the
+        // default 100 units/sec. Segment 0002 is that black; the two real segments come out a
+        // little longer than their sources, which is what the retime is there to absorb.
+        var probe = new FakeMediaProbe()
+            .WithDuration("A.mp4", 2000).WithDuration("B.mp4", 5000)
+            .WithDuration("0001.mkv", 2048).WithDuration("0002.mkv", 1000).WithDuration("0003.mkv", 5120);
+
+        MergeOptions options = workspace.Options(
+            nameof(A_gapped_merge_keeps_the_script_and_the_video_on_the_same_timeline),
+            insertTransitionGaps: true);
+
+        Assert.True(await Run(workspace, options, new FakeJobLogger(), probe: probe));
+
+        Funscript merged = ReadScript(options);
+
+        // B starts at 2048 + 1000, and the parked keyframe sits halfway through the black.
+        Assert.Equal([0, 3048], merged.Bookmarks!.Select(bookmark => bookmark.Time));
+        Assert.Equal(
+            [(0, 0), (1000, 100), (2548, 50), (3048, 0), (3548, 50)],
+            merged.Actions!.Select(action => (action.At, action.Pos)));
+
+        // The script covers exactly what the three segments add up to.
+        Assert.Equal((2048 + 1000 + 5120) / 1000, merged.Metadata!.Duration);
+    }
+
+    /// <remarks>
+    /// The gap is black, not content, so it belongs to the chapter before it - which also keeps
+    /// every scene's chapter opening on its first real frame rather than on a second of black.
+    /// </remarks>
+    [Fact]
+    public async Task A_gap_lands_inside_the_chapter_before_it() {
+        using var workspace = new TempWorkspace();
+        workspace.WriteScript("A.funscript", ScriptBuilder.Basic((0, 0), (1000, 100)));
+        workspace.WriteScript("B.funscript", ScriptBuilder.Basic((0, 0)));
+        workspace.WriteVideo("A.mp4");
+        workspace.WriteVideo("B.mp4");
+
+        var probe = new FakeMediaProbe()
+            .WithDuration("A.mp4", 2000).WithDuration("B.mp4", 5000)
+            .WithDuration("0001.mkv", 2000).WithDuration("0002.mkv", 1000).WithDuration("0003.mkv", 5000);
+
+        MergeOptions options = workspace.Options(
+            nameof(A_gap_lands_inside_the_chapter_before_it), insertTransitionGaps: true);
+
+        string chapters = string.Empty;
+
+        // Captured while the concat runs, because the coordinator clears the file once the job
+        // is over - which is the point of it owning that file's lifetime.
+        var runner = new FakeProcessRunner {
+            Respond = invocation => {
+                if (invocation.Arguments.Contains("concat")) {
+                    chapters = File.ReadAllText(options.ChapterMetadataFile).ReplaceLineEndings("\r\n");
+                }
+
+                return string.Empty;
+            }
+        };
+
+        Assert.True(await Run(workspace, options, new FakeJobLogger(), runner, probe));
+
+        // A runs to 3000 rather than 2000: its chapter swallowed the gap. B opens on content.
+        Assert.Contains("START=0\r\nEND=3000\r\ntitle=A", chapters);
+        Assert.Contains("START=3000\r\nEND=8000\r\ntitle=B", chapters);
+    }
+
+    /// <remarks>
     /// A retime that cannot be trusted is not applied at all: the script written by step one is
     /// still correct to the sources, which beats one shifted onto boundaries that may be wrong.
     /// </remarks>
@@ -329,6 +408,74 @@ public class MergeCoordinatorTests
         Assert.True(logger.WarnedAbout("Skipping video 'A'"));
         Assert.True(logger.WarnedAbout("Nothing left to merge"));
         Assert.False(File.Exists(options.OutputScriptPath));
+    }
+
+    /// <remarks>
+    /// The top level only is what the scan has always done, so a scene tucked into a subfolder
+    /// is not merged by accident - it takes the option being turned on.
+    /// </remarks>
+    [Fact]
+    public async Task A_scene_in_a_subfolder_is_out_of_reach_of_an_ordinary_run() {
+        using var workspace = new TempWorkspace();
+        workspace.WriteScript(@"Scenes\A.funscript", ScriptBuilder.Basic((0, 0), (1000, 100)));
+        workspace.WriteVideo(@"Scenes\A.mp4");
+
+        var logger = new FakeJobLogger();
+
+        Assert.False(await Run(
+            workspace, nameof(A_scene_in_a_subfolder_is_out_of_reach_of_an_ordinary_run), logger));
+
+        Assert.True(logger.WarnedAbout("Nothing to merge"));
+    }
+
+    [Fact]
+    public async Task A_recursive_run_merges_the_scenes_it_finds_in_the_subfolders() {
+        using var workspace = new TempWorkspace();
+        workspace.WriteScript(@"Scenes\A.funscript", ScriptBuilder.Basic((0, 0), (1000, 100)));
+        workspace.WriteVideo(@"Scenes\A.mp4");
+        workspace.WriteScript(@"Scenes\More\B.funscript", ScriptBuilder.Basic((0, 0), (1000, 50)));
+        workspace.WriteVideo(@"Scenes\More\B.mp4");
+
+        var logger = new FakeJobLogger();
+        var probe = new FakeMediaProbe { DefaultDurationMs = 2000 };
+        MergeOptions options = workspace.Options(
+            nameof(A_recursive_run_merges_the_scenes_it_finds_in_the_subfolders),
+            includeInputSubfolders: true);
+
+        Assert.True(await Run(workspace, options, logger, probe: probe));
+
+        Funscript merged = ReadScript(options);
+
+        // Both scenes, the second one moved along by the first video's length.
+        Assert.Equal([0, 1000, 2000, 3000], merged.Actions!.Select(action => action.At));
+        Assert.Equal(["A", "B"], merged.Bookmarks!.Select(bookmark => bookmark.Name));
+    }
+
+    /// <remarks>
+    /// A scene is identified by filename, so the same name in two folders is read as one scene:
+    /// both videos pair with the same script, and only one script of the name is used. The run
+    /// still goes ahead - it is a merge, not a mistake - but it has to say so.
+    /// </remarks>
+    [Fact]
+    public async Task A_name_used_by_two_subfolders_is_reported_as_ambiguous() {
+        using var workspace = new TempWorkspace();
+        workspace.WriteScript(@"First\Scene.funscript", ScriptBuilder.Basic((0, 0), (1000, 100)));
+        workspace.WriteVideo(@"First\Scene.mp4");
+        workspace.WriteVideo(@"Second\Scene.mp4");
+
+        var logger = new FakeJobLogger();
+        var probe = new FakeMediaProbe { DefaultDurationMs = 2000 };
+
+        Assert.True(await Run(
+            workspace,
+            workspace.Options(
+                nameof(A_name_used_by_two_subfolders_is_reported_as_ambiguous),
+                includeInputSubfolders: true),
+            logger,
+            probe: probe));
+
+        Assert.True(logger.WarnedAbout("The same name is used in more than one input folder"));
+        Assert.True(logger.WarnedAbout("Scene"));
     }
 
     private static Task<bool> Run(

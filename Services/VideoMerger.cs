@@ -7,6 +7,13 @@ namespace AttcksMergeTool.Services;
 /// then stream-copies the segments together into the final output with chapters
 /// attached. Re-encoding up front is what makes the lossless concat possible.
 /// </summary>
+/// <remarks>
+/// Generated stretches of black are interleaved between the scenes, one wherever the merged
+/// script asked for a transition. They are encoded exactly like a real segment - same encoder,
+/// container and audio layout - so the concat cannot tell them apart, and they are measured
+/// like one too, because the time they occupy has to be accounted for by everything
+/// downstream that walks the output's timeline.
+/// </remarks>
 public sealed class VideoMerger
 {
     private readonly IJobLogger _logger;
@@ -48,7 +55,8 @@ public sealed class VideoMerger
         IReadOnlyList<EncodedSegment> segments;
 
         try {
-            segments = await EncodeSegmentsAsync(videoFiles, progress, cancellationToken);
+            segments = await EncodeSegmentsAsync(
+                PlanJobs(videoFiles, scriptResult), progress, cancellationToken);
 
             // Chapters sit between the two phases because they describe the segments the
             // concat is about to join, and the concat is what consumes the file they go in.
@@ -68,52 +76,121 @@ public sealed class VideoMerger
     }
 
     /// <summary>
-    /// Transcodes each source video into a temp segment, up to
+    /// The segments to produce, in concat order: each video, preceded by a stretch of black
+    /// wherever the merged script left room for one.
+    /// </summary>
+    /// <remarks>
+    /// The gap lengths come from the script merge rather than being recomputed here, because
+    /// they were already spent - the merged script placed its keyframes inside them. Working
+    /// them out a second time would risk the two halves disagreeing about a length only one of
+    /// them can be right about.
+    /// <para>
+    /// A run with no script has no axes to move and so no gaps; a run whose spans do not line
+    /// up with its videos is not one this can safely read lead-ins out of, so it gets none
+    /// either and says so.
+    /// </para>
+    /// </remarks>
+    private List<EncodeJob> PlanJobs(IReadOnlyList<string> videoFiles, FunscriptMergeResult? scriptResult) {
+        IReadOnlyList<SceneSpan>? spans = scriptResult?.Spans;
+
+        if (spans is not null && spans.Count != videoFiles.Count) {
+            _logger.Log(
+                $"The merged script covers {spans.Count} scenes but the video is being built "
+                + $"from {videoFiles.Count}. Scenes will be joined with no transition gaps.",
+                LogLevel.Warning);
+
+            spans = null;
+        }
+
+        var jobs = new List<EncodeJob>(videoFiles.Count);
+
+        for (int index = 0; index < videoFiles.Count; index++) {
+            int leadInMs = spans?[index].LeadInMs ?? 0;
+
+            // Ahead of the scene, matching where the script put the keyframes that cross it.
+            if (leadInMs > 0) jobs.Add(new EncodeJob(videoFiles[index], leadInMs));
+
+            jobs.Add(new EncodeJob(videoFiles[index], 0));
+        }
+
+        return jobs;
+    }
+
+    /// <summary>
+    /// Produces each planned segment in a temp file, up to
     /// <see cref="MergeOptions.MaxParallelEncodes"/> at a time, and measures what came out.
     /// </summary>
     private async Task<IReadOnlyList<EncodedSegment>> EncodeSegmentsAsync(
-        IReadOnlyList<string> videoFiles,
+        IReadOnlyList<EncodeJob> jobs,
         IProgress<MergeProgress>? progress,
         CancellationToken cancellationToken) {
         int completed = 0;
 
-        // Indexed by position in videoFiles, so the concat order matches the script merge,
-        // which walks the same scenes in the same order. Numbering at dispatch time instead
-        // would follow scheduling order and could desync the merged video from the script.
-        var segments = new EncodedSegment[videoFiles.Count];
+        // Indexed by position in the plan, so the concat order matches the script merge, which
+        // walks the same scenes and the same gaps in the same order. Numbering at dispatch
+        // time instead would follow scheduling order and could desync the two.
+        var segments = new EncodedSegment[jobs.Count];
 
-        progress?.Report(new MergeProgress(0, videoFiles.Count));
+        progress?.Report(new MergeProgress(0, jobs.Count));
 
         var parallelOptions = new ParallelOptions {
             MaxDegreeOfParallelism = _options.MaxParallelEncodes,
             CancellationToken = cancellationToken
         };
 
-        IEnumerable<(string Path, int Index)> sources = videoFiles.Select((path, index) => (path, index));
+        IEnumerable<(EncodeJob Job, int Index)> sources = jobs.Select((job, index) => (job, index));
 
         await Parallel.ForEachAsync(sources, parallelOptions, async (source, token) => {
-            VideoSegmentSettings? trim = _trims.ForFile(source.Path);
+            (EncodeJob job, int index) = source;
 
-            string segmentName = $"{source.Index + 1:D4}{FFmpegArguments.TempSegmentExtension(_options.UseAv1)}";
+            string segmentName = $"{index + 1:D4}{FFmpegArguments.TempSegmentExtension(_options.UseAv1)}";
             string segmentPath = Path.Combine(_options.TempFolder, segmentName);
 
-            List<string> args = FFmpegArguments.BuildEncode(source.Path, segmentPath, trim, _options);
+            if (job.IsGap) {
+                _logger.Log($"Generating: {job.GapMs}ms transition before {Path.GetFileName(job.SourcePath)}");
 
-            _logger.Log($"Encoding: {Path.GetFileName(source.Path)}");
-            await _runner.RunAsync(_options.FfmpegPath, args, token);
+                await _runner.RunAsync(
+                    _options.FfmpegPath,
+                    FFmpegArguments.BuildBlackSegment(segmentPath, job.GapMs, _options),
+                    token);
+            } else {
+                VideoSegmentSettings? trim = _trims.ForFile(job.SourcePath);
+
+                _logger.Log($"Encoding: {Path.GetFileName(job.SourcePath)}");
+
+                await _runner.RunAsync(
+                    _options.FfmpegPath,
+                    FFmpegArguments.BuildEncode(job.SourcePath, segmentPath, trim, _options),
+                    token);
+            }
 
             // Measured rather than inherited from the source: forcing a common frame rate and
             // rounding the trim to frames both move the boundary, and chapters built from the
-            // source durations would drift a little further with every scene.
+            // source durations would drift a little further with every scene. A gap is
+            // measured for the same reason - what it asked for and what ffmpeg wrote differ.
             int? durationMs = await _probe.GetDurationMsAsync(segmentPath, token);
 
             // Each slot is written by exactly one iteration, so no synchronization is needed.
-            segments[source.Index] = new EncodedSegment(source.Path, segmentPath, durationMs);
+            segments[index] = new EncodedSegment(job.SourcePath, segmentPath, durationMs, job.IsGap);
 
-            progress?.Report(new MergeProgress(Interlocked.Increment(ref completed), videoFiles.Count));
+            progress?.Report(new MergeProgress(Interlocked.Increment(ref completed), jobs.Count));
         });
 
         return segments;
+    }
+
+    /// <summary>One segment to produce.</summary>
+    /// <param name="SourcePath">
+    /// The video to encode, or for a gap the video it runs in front of - which is only used to
+    /// name it in the log and in the chapter that swallows it.
+    /// </param>
+    /// <param name="GapMs">
+    /// How long a stretch of black to generate, or zero to encode <paramref name="SourcePath"/>
+    /// itself.
+    /// </param>
+    private readonly record struct EncodeJob(string SourcePath, int GapMs)
+    {
+        public bool IsGap => GapMs > 0;
     }
 
     /// <summary>

@@ -1,4 +1,4 @@
-﻿using AttcksMergeTool.Models;
+﻿﻿using AttcksMergeTool.Models;
 
 namespace AttcksMergeTool.Services;
 
@@ -22,10 +22,15 @@ public static class SceneScriptIndex
     /// It has to match what the merge itself will scan with, or a scene could be paired here
     /// with a video the merge does not see.
     /// </param>
-    public static List<SceneScripts> Build(string folder, IReadOnlyCollection<string>? videoExtensions = null) =>
+    /// <param name="scan">
+    /// How the folder is walked. It has to match the merge's own walk for the same reason the
+    /// extension list does: a scene found here but not there pairs with nothing.
+    /// </param>
+    public static List<SceneScripts> Build(
+        string folder, IReadOnlyCollection<string>? videoExtensions = null, InputScan scan = default) =>
         Build(
-            MediaFileScanner.FindFunscripts(folder),
-            MediaFileScanner.FindVideos(folder, videoExtensions));
+            MediaFileScanner.FindFunscripts(folder, scan),
+            MediaFileScanner.FindVideos(folder, videoExtensions, scan));
 
     /// <summary>
     /// Scenes described by <paramref name="scriptPaths"/> and <paramref name="videoPaths"/>,
