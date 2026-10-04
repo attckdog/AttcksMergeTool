@@ -321,7 +321,75 @@ public class MergeCoordinatorTests
         Assert.Equal(["B", "A"], ReadScript(options).Bookmarks!.Select(bookmark => bookmark.Name));
     }
 
+    /// <remarks>
+    /// Both halves drop it: the video is not encoded and its scene leaves no marker, so the
+    /// merged script still describes exactly the video that was built.
+    /// </remarks>
+    [Fact]
+    public async Task A_disabled_video_is_left_out_of_both_the_encode_and_the_script() {
+        using var workspace = new TempWorkspace();
+        workspace.WriteScript("A.funscript", ScriptBuilder.Basic((0, 0), (1000, 100)));
+        workspace.WriteScript("B.funscript", ScriptBuilder.Basic((0, 0), (500, 50)));
+        workspace.WriteScript("C.funscript", ScriptBuilder.Basic((0, 0), (500, 50)));
+        workspace.WriteVideo("A.mp4");
+        workspace.WriteVideo("B.mp4");
+        workspace.WriteVideo("C.mp4");
+
+        var logger = new FakeJobLogger();
+        var runner = new FakeProcessRunner();
+        var probe = new FakeMediaProbe { DefaultDurationMs = 2000 };
+        MergeOptions options = workspace.Options(nameof(A_disabled_video_is_left_out_of_both_the_encode_and_the_script));
+
+        var coordinator = new MergeCoordinator(
+            logger,
+            options,
+            [
+                Segment(workspace.Path("A.mp4")),
+                Disabled(workspace.Path("B.mp4")),
+                Segment(workspace.Path("C.mp4"))
+            ],
+            runner,
+            probe);
+
+        Assert.True(await coordinator.RunAsync());
+
+        Assert.Equal(["A", "C"], ReadScript(options).Bookmarks!.Select(bookmark => bookmark.Name));
+        Assert.Equal([0, 2000], ReadScript(options).Bookmarks!.Select(bookmark => bookmark.Time));
+
+        Assert.DoesNotContain(
+            runner.Invocations,
+            invocation => invocation.Arguments.Any(argument => argument.EndsWith("B.mp4", StringComparison.Ordinal)));
+
+        // Reported as switched off, not as a funscript that lost its video.
+        Assert.True(logger.WarnedAbout("Skipping video 'B'"));
+        Assert.False(logger.WarnedAbout("No video found for funscript 'B'"));
+    }
+
+    /// <remarks>
+    /// With no video left the plan would fall back to a script-only merge, which would bring
+    /// back every scene the user had just switched off.
+    /// </remarks>
+    [Fact]
+    public async Task Disabling_every_video_stops_the_run_rather_than_merging_the_scripts_alone() {
+        using var workspace = new TempWorkspace();
+        workspace.WriteScript("A.funscript", ScriptBuilder.Basic((0, 0), (1000, 100)));
+        workspace.WriteVideo("A.mp4");
+
+        var logger = new FakeJobLogger();
+        MergeOptions options = workspace.Options(nameof(Disabling_every_video_stops_the_run_rather_than_merging_the_scripts_alone));
+
+        var coordinator = new MergeCoordinator(
+            logger, options, [Disabled(workspace.Path("A.mp4"))], new FakeProcessRunner(), new FakeMediaProbe());
+
+        Assert.False(await coordinator.RunAsync());
+
+        Assert.True(logger.WarnedAbout("every video is disabled"));
+        Assert.False(File.Exists(options.OutputScriptPath));
+    }
+
     private static VideoSegmentSettings Segment(string path) => new() { FilePath = path };
+
+    private static VideoSegmentSettings Disabled(string path) => new() { FilePath = path, Enabled = false };
 
     /// <summary>
     /// The video that <paramref name="segmentFile"/> was encoded from. Segments are numbered by

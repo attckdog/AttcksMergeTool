@@ -1,4 +1,4 @@
-using AttcksMergeTool.Models;
+﻿using AttcksMergeTool.Models;
 
 namespace AttcksMergeTool.UI;
 
@@ -42,6 +42,14 @@ public sealed partial class MainForm
         ForeColor = Color.White
     };
 
+    // Right-click menu on a video row. The toggle's text is set as the menu opens, to whichever
+    // of Enable and Disable the row it was opened on needs.
+    private readonly ContextMenuStrip _videoMenu = new() { ShowImageMargin = false };
+    private readonly ToolStripMenuItem _mnuPreview = new("Preview");
+    private readonly ToolStripMenuItem _mnuCopyName = new("Copy Name");
+    private readonly ToolStripMenuItem _mnuShowInFolder = new("Show in Folder");
+    private readonly ToolStripMenuItem _mnuToggleEnabled = new("Disable");
+
     // Merge order. The list's order is the concat order, so these decide where each scene
     // lands in the merged video and its script.
     private readonly Button _btnMoveUp = new() { Text = "Move Up", ForeColor = Color.White, FlatStyle = FlatStyle.Flat };
@@ -52,6 +60,18 @@ public sealed partial class MainForm
     private readonly CheckBox _chkEnableTrim = new() { Text = "Enable Trimming", Dock = DockStyle.Top, Height = 30 };
     private readonly NumericUpDown _numStart = new() { Dock = DockStyle.Left, Width = 120, DecimalPlaces = 3, Maximum = MaxTrimSeconds };
     private readonly NumericUpDown _numEnd = new() { Dock = DockStyle.Left, Width = 120, DecimalPlaces = 3, Maximum = MaxTrimSeconds };
+
+    // Injected audio. Edited like the trim: the controls show the selected video's settings,
+    // and nothing reaches it until one of the Apply buttons is pressed.
+    private readonly Label _lblVoiceSummary = new() { Dock = DockStyle.Top, Height = 28, TextAlign = ContentAlignment.MiddleLeft, AutoEllipsis = true };
+    private readonly Button _btnChooseVoice = new() { Text = "Choose Folders...", ForeColor = Color.White, FlatStyle = FlatStyle.Flat };
+    private readonly Button _btnClearVoice = new() { Text = "Clear", ForeColor = Color.White, FlatStyle = FlatStyle.Flat };
+    private readonly NumericUpDown _numVoiceVolume = NewVoiceNumeric(0, 400, VoiceInjection.DefaultVoiceVolumePercent, decimals: 0, increment: 10);
+    private readonly NumericUpDown _numOriginalVolume = NewVoiceNumeric(0, 200, VoiceInjection.DefaultOriginalVolumePercent, decimals: 0, increment: 10);
+    private readonly NumericUpDown _numGapMin = NewVoiceNumeric(0, 600, VoiceInjection.DefaultMinGapSeconds, decimals: 1, increment: 0.5M);
+    private readonly NumericUpDown _numGapMax = NewVoiceNumeric(0, 600, VoiceInjection.DefaultMaxGapSeconds, decimals: 1, increment: 0.5M);
+    private readonly Button _btnApplyVoice = new() { Text = "Apply to Selected", ForeColor = Color.White, FlatStyle = FlatStyle.Flat };
+    private readonly Button _btnApplyVoiceAll = new() { Text = "Apply to All", ForeColor = Color.White, FlatStyle = FlatStyle.Flat };
 
     // Output
     private readonly RichTextBox _txtLog = new() { Dock = DockStyle.Fill, ForeColor = Color.LightGray, ReadOnly = true, Font = Theme.LogFont };
@@ -85,6 +105,8 @@ public sealed partial class MainForm
     private const int LengthColumn = 1;
     private const int ScriptColumn = 2;
     private const int AxesColumn = 3;
+    private const int AudioColumn = 4;
+    private const int VoiceColumn = 5;
 
     /// <summary>Blank space at each edge of a cell, so its text does not touch its neighbour.</summary>
     private const int CellInset = 2;
@@ -96,13 +118,15 @@ public sealed partial class MainForm
     private const int CellPadding = (2 * CellInset) + 8;
 
     /// <summary>
-    /// The three measured columns together. Read back off the columns rather than tracked
+    /// The measured columns together. Read back off the columns rather than tracked
     /// separately, so it cannot drift from what they were actually sized to.
     /// </summary>
     private int FixedColumnsWidth =>
         _lstVideos.Columns[LengthColumn].Width
         + _lstVideos.Columns[ScriptColumn].Width
-        + _lstVideos.Columns[AxesColumn].Width;
+        + _lstVideos.Columns[AxesColumn].Width
+        + _lstVideos.Columns[AudioColumn].Width
+        + _lstVideos.Columns[VoiceColumn].Width;
 
     private void BuildUi() {
         Text = "Attcks Funscript & Video Merger";
@@ -130,6 +154,7 @@ public sealed partial class MainForm
         _btnOptions.Click += BtnOptions_Click;
 
         BuildVideoColumns();
+        BuildVideoMenu();
         _lstVideos.SelectedIndexChanged += LstVideos_SelectedIndexChanged;
 
         _btnMoveUp.Click += (_, _) => MoveSelectedVideo(-1);
@@ -201,13 +226,14 @@ public sealed partial class MainForm
     private TableLayoutPanel BuildSidePanel() {
         GroupBox orderGroup = BuildOrderGroup();
         GroupBox trimGroup = BuildTrimGroup();
+        GroupBox voiceGroup = BuildVoiceGroup();
 
         var panel = new TableLayoutPanel {
             Dock = DockStyle.Fill,
             BackColor = Theme.SidePanel,
             Padding = new Padding(10),
             ColumnCount = 1,
-            RowCount = 4
+            RowCount = 5
         };
 
         panel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
@@ -218,10 +244,12 @@ public sealed partial class MainForm
         // group alone would give the group back less than it was measured for and clip it.
         _lstVideos.Margin = new Padding(0);
         orderGroup.Margin = new Padding(0, 5, 0, 15);
-        trimGroup.Margin = new Padding(0);
+        trimGroup.Margin = new Padding(0, 0, 0, 15);
+        voiceGroup.Margin = new Padding(0);
 
         panel.RowStyles.Add(new RowStyle(SizeType.Absolute, orderGroup.Height + orderGroup.Margin.Vertical));
         panel.RowStyles.Add(new RowStyle(SizeType.Absolute, trimGroup.Height + trimGroup.Margin.Vertical));
+        panel.RowStyles.Add(new RowStyle(SizeType.Absolute, voiceGroup.Height + voiceGroup.Margin.Vertical));
 
         var listLabel = new Label {
             Text = "Detected Videos:",
@@ -235,12 +263,13 @@ public sealed partial class MainForm
         panel.Controls.Add(_lstVideos, 0, 1);
         panel.Controls.Add(orderGroup, 0, 2);
         panel.Controls.Add(trimGroup, 0, 3);
+        panel.Controls.Add(voiceGroup, 0, 4);
 
         return panel;
     }
 
     /// <summary>
-    /// The video list's columns. The three on the right are sized to their own contents, and
+    /// The video list's columns. The ones on the right are sized to their own contents, and
     /// the name column takes whatever is left - see <see cref="ResizeNameColumn"/>.
     /// </summary>
     /// <remarks>
@@ -253,6 +282,8 @@ public sealed partial class MainForm
         AddMeasuredColumn("Length", TrimMarker + "0:00:00", HorizontalAlignment.Right);
         AddMeasuredColumn("Script", "Yes", HorizontalAlignment.Center);
         AddMeasuredColumn("Axes", "99", HorizontalAlignment.Right);
+        AddMeasuredColumn("Audio", "Yes", HorizontalAlignment.Center);
+        AddMeasuredColumn("Voice", "99", HorizontalAlignment.Center);
 
         // The header and the rows are drawn by hand: a Details ListView otherwise paints them
         // in the system colours, which read as a bright strip in this dark panel.
@@ -278,7 +309,7 @@ public sealed partial class MainForm
     /// </summary>
     private void ResizeNameColumn() {
         // Resize can arrive before the columns exist, while the list is being laid out.
-        if (_lstVideos.Columns.Count <= AxesColumn) return;
+        if (_lstVideos.Columns.Count <= VoiceColumn) return;
 
         // ClientSize already excludes the vertical scrollbar when the list is showing one, so
         // the couple of pixels taken off here are only the ones a rounded-up column would spill
@@ -287,6 +318,24 @@ public sealed partial class MainForm
         int available = _lstVideos.ClientSize.Width - FixedColumnsWidth - (2 * CellInset);
 
         _lstVideos.Columns[NameColumn].Width = Math.Max(60, available);
+    }
+
+    private void BuildVideoMenu() {
+        _videoMenu.Renderer = new ToolStripProfessionalRenderer(new DarkMenuColors());
+        _videoMenu.BackColor = Theme.Toolbar;
+        _videoMenu.ForeColor = Theme.Text;
+
+        _videoMenu.Items.AddRange([
+            _mnuPreview, _mnuCopyName, _mnuShowInFolder, new ToolStripSeparator(), _mnuToggleEnabled
+        ]);
+
+        _videoMenu.Opening += VideoMenu_Opening;
+        _mnuPreview.Click += (_, _) => WithMenuVideo(PreviewVideo);
+        _mnuCopyName.Click += (_, _) => WithMenuVideo(CopyVideoName);
+        _mnuShowInFolder.Click += (_, _) => WithMenuVideo(ShowVideoInFolder);
+        _mnuToggleEnabled.Click += (_, _) => WithMenuVideo(ToggleVideoEnabled);
+
+        _lstVideos.ContextMenuStrip = _videoMenu;
     }
 
     private void LstVideos_DrawColumnHeader(object? sender, DrawListViewColumnHeaderEventArgs e) {
@@ -316,7 +365,13 @@ public sealed partial class MainForm
     /// as the pointer crossed the row.
     /// </remarks>
     private void LstVideos_DrawItem(object? sender, DrawListViewItemEventArgs e) {
-        using var brush = new SolidBrush(e.Item.Selected ? Theme.PrimaryAction : Theme.Well);
+        // A disabled row keeps its red when selected, as the fill rather than the text: red text
+        // on the selection blue is unreadable, and white on blue would hide that it is disabled.
+        Color selection = e.Item.Tag is VideoSegmentSettings { Enabled: false }
+            ? Theme.DestructiveAction
+            : Theme.PrimaryAction;
+
+        using var brush = new SolidBrush(e.Item.Selected ? selection : Theme.Well);
         e.Graphics.FillRectangle(brush, e.Bounds);
 
         // Walked left to right from the row's own left edge, which already accounts for how
@@ -427,6 +482,93 @@ public sealed partial class MainForm
         return group;
     }
 
+    /// <summary>
+    /// The injected-audio settings for the selected video: which library folders its voice
+    /// clips come from, how loud they and the video's own audio play, and the silence between
+    /// clips.
+    /// </summary>
+    private GroupBox BuildVoiceGroup() {
+        int rowHeight = Font.Height + 18;
+
+        var group = new GroupBox {
+            Text = "Injected Audio",
+            Dock = DockStyle.Fill,
+            // Summary, folder buttons, two rows of numbers and the apply buttons, plus the
+            // caption and padding - measured like the order group, for the same reason.
+            Height = 28 + (4 * rowHeight) + Font.Height + 24,
+            ForeColor = Color.White,
+            Padding = new Padding(10, 4, 10, 10)
+        };
+
+        foreach (Button button in new[] { _btnChooseVoice, _btnClearVoice, _btnApplyVoice, _btnApplyVoiceAll }) {
+            button.Dock = DockStyle.Fill;
+            button.Margin = new Padding(2);
+        }
+
+        _btnChooseVoice.BackColor = Theme.PrimaryAction;
+        _btnClearVoice.BackColor = Theme.SecondaryAction;
+        _btnApplyVoice.BackColor = Theme.ConfirmAction;
+        _btnApplyVoiceAll.BackColor = Theme.ConfirmAction;
+
+        _btnChooseVoice.Click += BtnChooseVoice_Click;
+        _btnClearVoice.Click += BtnClearVoice_Click;
+        _btnApplyVoice.Click += BtnApplyVoice_Click;
+        _btnApplyVoiceAll.Click += BtnApplyVoiceAll_Click;
+
+        var grid = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 4, RowCount = 4 };
+
+        grid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 30F));
+        grid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 20F));
+        grid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 30F));
+        grid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 20F));
+
+        for (int row = 0; row < grid.RowCount; row++) {
+            grid.RowStyles.Add(new RowStyle(SizeType.Absolute, rowHeight));
+        }
+
+        grid.Controls.Add(_btnChooseVoice, 0, 0);
+        grid.SetColumnSpan(_btnChooseVoice, 3);
+        grid.Controls.Add(_btnClearVoice, 3, 0);
+
+        grid.Controls.Add(VoiceCaption("Voice %:"), 0, 1);
+        grid.Controls.Add(_numVoiceVolume, 1, 1);
+        grid.Controls.Add(VoiceCaption("Original %:"), 2, 1);
+        grid.Controls.Add(_numOriginalVolume, 3, 1);
+
+        grid.Controls.Add(VoiceCaption("Gap min (s):"), 0, 2);
+        grid.Controls.Add(_numGapMin, 1, 2);
+        grid.Controls.Add(VoiceCaption("Gap max (s):"), 2, 2);
+        grid.Controls.Add(_numGapMax, 3, 2);
+
+        grid.Controls.Add(_btnApplyVoice, 0, 3);
+        grid.SetColumnSpan(_btnApplyVoice, 2);
+        grid.Controls.Add(_btnApplyVoiceAll, 2, 3);
+        grid.SetColumnSpan(_btnApplyVoiceAll, 2);
+
+        // Fill first, then the summary docked above it.
+        group.Controls.Add(grid);
+        group.Controls.Add(_lblVoiceSummary);
+
+        return group;
+    }
+
+    private static Label VoiceCaption(string text) => new() {
+        Text = text,
+        Dock = DockStyle.Fill,
+        TextAlign = ContentAlignment.MiddleLeft,
+        Margin = new Padding(0)
+    };
+
+    private static NumericUpDown NewVoiceNumeric(int minimum, int maximum, double value, int decimals, decimal increment) => new() {
+        Minimum = minimum,
+        Maximum = maximum,
+        Value = (decimal)value,
+        DecimalPlaces = decimals,
+        Increment = increment,
+        Dock = DockStyle.Fill,
+        Margin = new Padding(2, 4, 2, 2)
+    };
+
     private static Panel BuildTimeRow(string caption, NumericUpDown input) {
         var row = new Panel { Dock = DockStyle.Top, Height = 35, Padding = new Padding(0, 5, 0, 0) };
 
@@ -449,7 +591,7 @@ public sealed partial class MainForm
         _toolTip.SetToolTip(_btnOpenOutput, "Opens the folder the merged video and funscript are written to in Explorer.");
         _toolTip.SetToolTip(_btnOptions, "Folders, ffmpeg and ffprobe paths, encoding quality and everything else that is remembered between launches.");
 
-        _toolTip.SetToolTip(_lstVideos, "The merge order, top to bottom. Select a video here to reorder it or configure its trim settings. Drag the divider on the left to resize this panel.");
+        _toolTip.SetToolTip(_lstVideos, "The merge order, top to bottom. Select a video here to reorder it or configure its trim settings; right-click it to preview or disable it. Drag the divider on the left to resize this panel.");
 
         _toolTip.SetToolTip(_btnMoveUp, "Moves the selected video one place earlier in the merge, taking its funscripts with it.");
         _toolTip.SetToolTip(_btnMoveDown, "Moves the selected video one place later in the merge, taking its funscripts with it.");
@@ -458,5 +600,14 @@ public sealed partial class MainForm
         _toolTip.SetToolTip(_chkEnableTrim, "Check this to trim the currently selected video in the list.");
         _toolTip.SetToolTip(_numStart, "The timestamp in seconds where the video segment should start.");
         _toolTip.SetToolTip(_numEnd, "The timestamp in seconds where the video segment should end. Set to 0 to keep the rest of the video.");
+
+        _toolTip.SetToolTip(_btnChooseVoice, "Picks the folders of the audio library that random voice clips are drawn from for this video. A folder includes everything below it.");
+        _toolTip.SetToolTip(_btnClearVoice, "Removes every folder, so this video keeps its own audio untouched once applied.");
+        _toolTip.SetToolTip(_numVoiceVolume, "How loud the injected clips play, as a percentage of their own level.");
+        _toolTip.SetToolTip(_numOriginalVolume, "How loud the video's own audio plays underneath the injected clips. Lower it to let the voices stand out.");
+        _toolTip.SetToolTip(_numGapMin, "The shortest silence between two injected clips, in seconds.");
+        _toolTip.SetToolTip(_numGapMax, "The longest silence between two injected clips, in seconds. Each gap is a random length between the two.");
+        _toolTip.SetToolTip(_btnApplyVoice, "Saves these injected audio settings to the selected video.");
+        _toolTip.SetToolTip(_btnApplyVoiceAll, "Saves these injected audio settings to every video in the list.");
     }
 }

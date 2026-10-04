@@ -1,4 +1,4 @@
-using AttcksMergeTool.Models;
+﻿using AttcksMergeTool.Models;
 using AttcksMergeTool.Services;
 using AttcksMergeTool.Tests.Support;
 
@@ -108,6 +108,21 @@ public class SceneDetailsReaderTests
 
         Assert.Null(details.DurationMs);
         Assert.True(details.HasScript);
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task Whether_the_video_has_audio_comes_from_the_probe(bool hasAudio) {
+        using var workspace = new TempWorkspace();
+
+        string video = workspace.WriteVideo("Scene.mp4");
+        FakeMediaProbe probe = new FakeMediaProbe().WithDuration("Scene.mp4", 4000);
+        if (!hasAudio) probe.WithoutAudio("Scene.mp4");
+
+        SceneDetails details = await SceneDetailsReader.ReadAsync(video, SceneOf(workspace, "Scene"), probe);
+
+        Assert.Equal(hasAudio, details.HasAudio);
     }
 
     private static Task<int> CountAxesAsync(TempWorkspace workspace) =>

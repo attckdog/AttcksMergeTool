@@ -52,4 +52,27 @@ public sealed class FFprobe : IMediaProbe
             ? (int)(seconds * 1000)
             : null;
     }
+
+    /// <inheritdoc />
+    public async Task<bool> HasAudioAsync(
+        string filePath,
+        CancellationToken cancellationToken = default) {
+        try {
+            // One line per audio stream; nothing at all for a mute file.
+            string output = await _runner.RunAsync(_executable, [
+                "-v", "error",
+                "-select_streams", "a",
+                "-show_entries", "stream=index",
+                "-of", "csv=p=0",
+                filePath
+            ], cancellationToken);
+
+            return !string.IsNullOrWhiteSpace(output);
+        } catch (OperationCanceledException) {
+            throw;
+        } catch (Exception) {
+            // Assume audio: the encode then reports why the file is unreadable.
+            return true;
+        }
+    }
 }

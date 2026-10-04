@@ -1,8 +1,9 @@
-namespace AttcksMergeTool.Models;
+﻿namespace AttcksMergeTool.Models;
 
 /// <summary>
 /// What the video list shows about one input file beyond its name: how long the video runs,
-/// whether a funscript was found for it and how many axes that scene's scripts contribute.
+/// whether a funscript was found for it, how many axes that scene's scripts contribute and
+/// whether the video has an audio track.
 /// </summary>
 /// <remarks>
 /// Display only, and deliberately not part of <see cref="VideoSegmentSettings"/>: a job clones
@@ -16,4 +17,9 @@ namespace AttcksMergeTool.Models;
 /// </param>
 /// <param name="HasScript">Whether the scene has a funscript of any kind, main or per-axis.</param>
 /// <param name="AxisCount">How many distinct axes those scripts would contribute to a merge.</param>
-public sealed record SceneDetails(int? DurationMs, bool HasScript, int AxisCount);
+/// <param name="HasAudio">
+/// Whether the video has an audio stream. Only meaningful when <paramref name="DurationMs"/>
+/// was read: an unreadable file reports <c>true</c> - see
+/// <see cref="Services.IMediaProbe.HasAudioAsync"/>.
+/// </param>
+public sealed record SceneDetails(int? DurationMs, bool HasScript, int AxisCount, bool HasAudio);

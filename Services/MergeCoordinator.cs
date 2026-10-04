@@ -14,6 +14,7 @@ public sealed class MergeCoordinator
     private readonly TrimLookup _trims;
     private readonly IProcessRunner _runner;
     private readonly IMediaProbe _probe;
+    private readonly AudioLibrary _audio;
 
     /// <summary>
     /// The video paths in the order the window listed them, which is the order the merge
@@ -21,24 +22,33 @@ public sealed class MergeCoordinator
     /// </summary>
     private readonly IReadOnlyList<string> _configuredOrder;
 
+    /// <summary>The video paths switched off in the window, which the merge leaves out.</summary>
+    private readonly HashSet<string> _disabledVideos;
+
     /// <param name="videoSettings">
     /// A snapshot of the per-video trim settings, in merge order. Taken by value so worker
     /// threads never read a collection the UI thread might be mutating.
     /// </param>
+    /// <param name="audio">The library voice clips are drawn from. Omitted, nothing is injected.</param>
     public MergeCoordinator(
         IJobLogger logger,
         MergeOptions options,
         IReadOnlyList<VideoSegmentSettings> videoSettings,
         IProcessRunner? runner = null,
-        IMediaProbe? probe = null) {
+        IMediaProbe? probe = null,
+        AudioLibrary? audio = null) {
         _logger = logger;
         _options = options;
         _trims = new TrimLookup(videoSettings);
         _configuredOrder = [.. videoSettings.Select(setting => setting.FilePath)];
+        _disabledVideos = new HashSet<string>(
+            videoSettings.Where(setting => !setting.Enabled).Select(setting => setting.FilePath),
+            StringComparer.OrdinalIgnoreCase);
         _runner = runner ?? ProcessRunner.Default;
         // Built from the options rather than FFprobe.Default so a configured ffprobe path is
         // honoured; Default is hard-wired to the bare name and would quietly ignore it.
         _probe = probe ?? new FFprobe(_runner, options.FfprobePath);
+        _audio = audio ?? AudioLibrary.Empty;
     }
 
     /// <summary>
@@ -76,8 +86,19 @@ public sealed class MergeCoordinator
 
         ReportAmbiguousNames(scannedVideos, scriptFiles);
 
+        // Classified against every video, disabled ones included: a disabled video still owns
+        // its scene name, and without it there its axis scripts would be read as scenes.
         List<SceneScripts> scenes = SceneScriptIndex.Build(scriptFiles, scannedVideos);
-        List<string> videoFiles = InConfiguredOrder(scannedVideos);
+        List<string> videoFiles = InConfiguredOrder(LeaveOutDisabled(scannedVideos, scenes));
+
+        // Checked before the plan: with no videos left it would fall back to a script-only
+        // merge, and put back every scene the user had just switched off.
+        if (scannedVideos.Count > 0 && videoFiles.Count == 0) {
+            _logger.Log(
+                "Nothing to merge: every video is disabled. Right-click one in the list to enable it.",
+                LogLevel.Warning);
+            return false;
+        }
 
         if (scenes.Count == 0 && videoFiles.Count == 0) {
             _logger.Log(
@@ -111,10 +132,19 @@ public sealed class MergeCoordinator
             FunscriptMergeResult? mergeResult = await scriptMerger.MergeAsync(plan.Entries, progress, cancellationToken);
 
             if (plannedVideos.Count > 0) {
-                var videoMerger = new VideoMerger(_logger, _options, _trims, _runner, _probe);
+                var videoMerger = new VideoMerger(_logger, _options, _trims, _runner, _probe, _audio);
 
-                IReadOnlyList<EncodedSegment> segments =
-                    await videoMerger.MergeAsync(plannedVideos, mergeResult, progress, cancellationToken);
+                IReadOnlyList<EncodedSegment> segments;
+
+                try {
+                    segments = await videoMerger.MergeAsync(plannedVideos, mergeResult, progress, cancellationToken);
+                } finally {
+                    // Whatever the voice clips were measured at is worth keeping, even from a run
+                    // that went on to fail: the next one will pick many of the same clips.
+                    if (!_audio.TrySaveIndex(out string? error)) {
+                        _logger.Log($"Could not save the audio index: {error}", LogLevel.Warning);
+                    }
+                }
 
                 if (mergeResult is not null) await RetimeScriptAsync(mergeResult, segments, cancellationToken);
             }
@@ -144,6 +174,37 @@ public sealed class MergeCoordinator
         if (MediaFileScanner.AmbiguousNameWarning(videoFiles, scriptFiles) is { } warning) {
             _logger.Log($"  -> {warning}", LogLevel.Warning);
         }
+    }
+
+    /// <summary>
+    /// The scanned videos minus the ones disabled in the window, with the disabled videos'
+    /// scenes taken out of <paramref name="scenes"/> too.
+    /// </summary>
+    /// <remarks>
+    /// The scenes go as well because the plan would otherwise find them unpaired and report
+    /// them as funscripts missing a video, which is not what happened. A scene is kept while
+    /// any enabled video still shares its name - with subfolders scanned, two videos can.
+    /// </remarks>
+    private List<string> LeaveOutDisabled(List<string> scanned, List<SceneScripts> scenes) {
+        if (_disabledVideos.Count == 0) return scanned;
+
+        List<string> enabled = [.. scanned.Where(path => !_disabledVideos.Contains(path))];
+
+        var enabledNames = new HashSet<string>(
+            enabled.Select(Path.GetFileNameWithoutExtension).OfType<string>(),
+            StringComparer.OrdinalIgnoreCase);
+
+        foreach (string path in scanned.Where(_disabledVideos.Contains)) {
+            string name = Path.GetFileNameWithoutExtension(path);
+
+            if (!enabledNames.Contains(name)) {
+                scenes.RemoveAll(scene => string.Equals(scene.Name, name, StringComparison.OrdinalIgnoreCase));
+            }
+
+            _logger.Log($"  -> Skipping video '{name}': it is disabled in the video list.", LogLevel.Warning);
+        }
+
+        return enabled;
     }
 
     /// <summary>

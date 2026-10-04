@@ -1,4 +1,4 @@
-using System.Diagnostics;
+﻿using System.Diagnostics;
 using AttcksMergeTool.Models;
 using AttcksMergeTool.Services;
 
@@ -52,6 +52,18 @@ public sealed partial class MainForm : Form
     /// </summary>
     private bool _closePending;
 
+    /// <summary>
+    /// The voice clip library, as last scanned. Replaced wholesale by a rescan; a running job
+    /// keeps the instance it started with.
+    /// </summary>
+    private AudioLibrary _audioLibrary = AudioLibrary.Empty;
+
+    /// <summary>
+    /// The folders shown in the injected-audio group, waiting to be applied - the folder
+    /// picker's counterpart to the values sitting in the trim inputs.
+    /// </summary>
+    private List<string> _pendingVoiceFolders = [];
+
     public MainForm() {
         // First: everything below either reads the settings or scans the folder they name.
         _settings = SettingsStore.Default.Load();
@@ -60,9 +72,18 @@ public sealed partial class MainForm : Form
         _logger = new RichTextBoxLogger(_txtLog);
 
         ApplySettingsToUi();
+        UpdateVoiceSummary();
 
         if (_settings.RefreshInputOnLaunch) LoadInputFiles();
+
+        StartAudioScan();
     }
+
+    /// <summary>The voice clip library's folder, resolved against the executable's.</summary>
+    private string AudioFolder => MergeOptions.ResolvePath(_settings.AudioFolder);
+
+    /// <summary>Where the library index - every clip and its measured length - is kept.</summary>
+    private static string AudioIndexPath => MergeOptions.ResolvePath(AudioLibrary.IndexFileName);
 
     /// <summary>
     /// Resolved against the executable's folder rather than the working directory, so the
@@ -94,21 +115,36 @@ public sealed partial class MainForm : Form
     /// </remarks>
     /// <param name="description">How the folder is named in the log, for a failure.</param>
     private void OpenFolder(string path, string description) {
+        string failure = $"Could not open {description.ToLowerInvariant()} '{path}'";
+
         try {
             if (!Directory.Exists(path)) {
                 Directory.CreateDirectory(path);
                 _logger.Log($"{description} '{path}' did not exist yet. Created it.", LogLevel.Warning);
             }
+        } catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException) {
+            _logger.Log($"{failure}: {ex.Message}", LogLevel.Error);
+            return;
+        }
 
-            // Shell execute, because the path is a folder rather than something to run - it is
-            // the shell that knows to hand it to the file browser.
-            using Process? browser = Process.Start(new ProcessStartInfo(path) { UseShellExecute = true });
-        } catch (Exception ex) when (ex is IOException
-                                         or UnauthorizedAccessException
+        // Shell execute, because the path is a folder rather than something to run - it is the
+        // shell that knows to hand it to the file browser.
+        StartProcess(new ProcessStartInfo(path) { UseShellExecute = true }, failure);
+    }
+
+    /// <summary>
+    /// Starts <paramref name="startInfo"/> without waiting on it, logging a failure as
+    /// "<paramref name="failure"/>: reason" rather than throwing.
+    /// </summary>
+    private void StartProcess(ProcessStartInfo startInfo, string failure) {
+        try {
+            using Process? process = Process.Start(startInfo);
+        } catch (Exception ex) when (ex is InvalidOperationException
                                          or ArgumentException
-                                         or NotSupportedException
                                          or System.ComponentModel.Win32Exception) {
-            _logger.Log($"Could not open {description.ToLowerInvariant()} '{path}': {ex.Message}", LogLevel.Error);
+            // Win32Exception covers a file type with no app associated with it, which is the
+            // likeliest way a preview fails.
+            _logger.Log($"{failure}: {ex.Message}", LogLevel.Error);
         }
     }
 
@@ -211,6 +247,8 @@ public sealed partial class MainForm : Form
         item.SubItems.Add(string.Empty);
         item.SubItems.Add(string.Empty);
         item.SubItems.Add(string.Empty);
+        item.SubItems.Add(string.Empty);
+        item.SubItems.Add(string.Empty);
 
         UpdateRow(item, settings);
 
@@ -219,13 +257,31 @@ public sealed partial class MainForm : Form
 
     /// <summary>Rewrites every cell of <paramref name="item"/> from the details read so far.</summary>
     private void UpdateRow(ListViewItem item, VideoSegmentSettings settings) {
+        FillCells(item, settings);
+
+        if (settings.Enabled) return;
+
+        // The whole row, over whatever colour each cell was given: what the cells say still
+        // holds, but none of it will reach the output while the video is switched off.
+        foreach (ListViewItem.ListViewSubItem cell in item.SubItems) cell.ForeColor = Theme.DisabledText;
+    }
+
+    private void FillCells(ListViewItem item, VideoSegmentSettings settings) {
         SetCell(item, NameColumn, RowLabel(settings), Theme.Text);
+
+        // Not a detail the scan reads, so it is known straight away.
+        SetCell(
+            item,
+            VoiceColumn,
+            settings.Voice is { IsActive: true } voice ? voice.Folders.Count.ToString() : "-",
+            settings.Voice is { IsActive: true } ? Theme.ConfirmAction : Theme.MutedText);
 
         if (_details.GetValueOrDefault(settings.FilePath) is not { } details) {
             // Not read yet. Saying so beats showing a zero, which would look like an answer.
             SetCell(item, LengthColumn, PendingCell, Theme.MutedText);
             SetCell(item, ScriptColumn, PendingCell, Theme.MutedText);
             SetCell(item, AxesColumn, PendingCell, Theme.MutedText);
+            SetCell(item, AudioColumn, PendingCell, Theme.MutedText);
 
             return;
         }
@@ -251,6 +307,14 @@ public sealed partial class MainForm : Form
             AxesColumn,
             details.AxisCount > 0 ? details.AxisCount.ToString() : "-",
             details.AxisCount > 0 ? Theme.Text : Theme.MutedText);
+
+        // Muted rather than red: a mute video still merges, with silence in its place. A file
+        // ffprobe could not read says nothing about its audio, so it gets the unknown marker.
+        SetCell(
+            item,
+            AudioColumn,
+            details.DurationMs is null ? UnknownCell : details.HasAudio ? "Yes" : "No",
+            details.DurationMs is not null && details.HasAudio ? Theme.Text : Theme.MutedText);
     }
 
     /// <summary>
@@ -456,6 +520,113 @@ public sealed partial class MainForm : Form
         RefreshVideoList(selected is null ? null : _videoSettings.IndexOf(selected));
     }
 
+    // --- Row context menu ---
+
+    /// <summary>
+    /// The video the context menu was opened on. Captured as it opens rather than read from
+    /// the selection on click, so a scan or refresh landing while the menu is up cannot point
+    /// the command at a different row.
+    /// </summary>
+    private VideoSegmentSettings? _menuVideo;
+
+    private void VideoMenu_Opening(object? sender, System.ComponentModel.CancelEventArgs e) {
+        _menuVideo = VideoUnderMenu();
+
+        // Nothing to act on - the click was below the last row.
+        if (_menuVideo is null) {
+            e.Cancel = true;
+            return;
+        }
+
+        _mnuToggleEnabled.Text = _menuVideo.Enabled ? "Disable" : "Enable";
+
+        // The running job merges its own copy of the list, so a toggle now would change nothing
+        // but what the list claims is being merged - the same reason reordering is locked.
+        _mnuToggleEnabled.Enabled = _jobCancellation is null;
+    }
+
+    /// <summary>
+    /// The row under the pointer, selected so the trim panel follows it; or the selected row,
+    /// when the menu came from the keyboard and the pointer could be anywhere.
+    /// </summary>
+    private VideoSegmentSettings? VideoUnderMenu() {
+        Point cursor = _lstVideos.PointToClient(Cursor.Position);
+
+        if (!_lstVideos.ClientRectangle.Contains(cursor)) return SelectedVideo;
+
+        if (_lstVideos.HitTest(cursor).Item is not { } item) return null;
+
+        item.Selected = true;
+        item.Focused = true;
+
+        return item.Tag as VideoSegmentSettings;
+    }
+
+    private void WithMenuVideo(Action<VideoSegmentSettings> command) {
+        if (_menuVideo is { } video) command(video);
+    }
+
+    /// <summary>Plays the video in whatever app Windows has associated with its file type.</summary>
+    private void PreviewVideo(VideoSegmentSettings video) {
+        if (!VideoStillExists(video)) return;
+
+        StartProcess(
+            new ProcessStartInfo(video.FilePath) { UseShellExecute = true },
+            $"Could not preview '{RowLabel(video)}'");
+    }
+
+    /// <summary>Opens the video's folder in Explorer with the file already highlighted.</summary>
+    private void ShowVideoInFolder(VideoSegmentSettings video) {
+        if (!VideoStillExists(video)) return;
+
+        StartProcess(
+            new ProcessStartInfo("explorer.exe", $"/select,\"{video.FilePath}\""),
+            $"Could not show '{RowLabel(video)}' in its folder");
+    }
+
+    /// <summary>
+    /// The list is only as fresh as the last refresh, so the file may have been moved or
+    /// deleted since. Said in the log rather than left to the shell's own error dialog.
+    /// </summary>
+    private bool VideoStillExists(VideoSegmentSettings video) {
+        if (File.Exists(video.FilePath)) return true;
+
+        _logger.Log(
+            $"'{video.FilePath}' is no longer there. Refresh Files to update the list.", LogLevel.Warning);
+
+        return false;
+    }
+
+    /// <summary>
+    /// Copies the filename, extension included - the name to search for or rename, which the
+    /// row label is not when subfolders are scanned and it carries a relative path.
+    /// </summary>
+    private void CopyVideoName(VideoSegmentSettings video) {
+        try {
+            Clipboard.SetText(video.FileName);
+        } catch (System.Runtime.InteropServices.ExternalException ex) {
+            // Another app holding the clipboard open.
+            _logger.Log($"Could not copy '{video.FileName}' to the clipboard: {ex.Message}", LogLevel.Error);
+        }
+    }
+
+    /// <summary>
+    /// Switches the video in or out of the merge. Its row stays where it is, so it keeps its
+    /// place in the order for when it is switched back on.
+    /// </summary>
+    private void ToggleVideoEnabled(VideoSegmentSettings video) {
+        // Checked again here: the job could have started while the menu was open.
+        if (_jobCancellation is not null) return;
+
+        video.Enabled = !video.Enabled;
+
+        RefreshVideoList();
+
+        _logger.Log(video.Enabled
+            ? $"Enabled {RowLabel(video)}."
+            : $"Disabled {RowLabel(video)}. It and its funscripts will be left out of the merge.");
+    }
+
     // --- Event handlers ---
 
     private void LstVideos_SelectedIndexChanged(object? sender, EventArgs e) {
@@ -464,6 +635,16 @@ public sealed partial class MainForm : Form
         _chkEnableTrim.Checked = settings.UseTrim;
         _numStart.Value = ClampToRange(_numStart, settings.StartTime);
         _numEnd.Value = ClampToRange(_numEnd, settings.EndTime);
+
+        VoiceInjection voice = settings.Voice ?? new VoiceInjection();
+
+        _pendingVoiceFolders = [.. voice.Folders];
+        _numVoiceVolume.Value = ClampToRange(_numVoiceVolume, voice.VoiceVolumePercent);
+        _numOriginalVolume.Value = ClampToRange(_numOriginalVolume, voice.OriginalVolumePercent);
+        _numGapMin.Value = ClampToRange(_numGapMin, voice.MinGapSeconds);
+        _numGapMax.Value = ClampToRange(_numGapMax, voice.MaxGapSeconds);
+
+        UpdateVoiceSummary();
     }
 
     /// <summary>
@@ -488,6 +669,137 @@ public sealed partial class MainForm : Form
         _logger.Log($"Saved settings for {RowLabel(settings)}");
     }
 
+    // --- Injected audio ---
+
+    /// <summary>
+    /// Indexes the audio library off the UI thread. Packs run to thousands of clips, and
+    /// the window has no reason to wait for them.
+    /// </summary>
+    private async void StartAudioScan() {
+        string folder = AudioFolder;
+
+        (AudioLibrary library, string? error) = await Task.Run(() => ScanAudioLibrary(folder));
+
+        if (IsDisposed) return;
+
+        _audioLibrary = library;
+        UpdateVoiceSummary();
+
+        if (error is not null) {
+            _logger.Log($"Could not read the audio library in {folder}: {error}", LogLevel.Warning);
+        } else if (library.FileCount > 0) {
+            _logger.Log($"Audio library: {library.FileCount} voice clips in {folder}");
+        }
+    }
+
+    /// <summary>
+    /// Scans the library and writes its index out. Never throws: a library that cannot be read
+    /// only means there is nothing to inject, so the reason comes back for the caller to log.
+    /// </summary>
+    private static (AudioLibrary Library, string? Error) ScanAudioLibrary(string folder) {
+        try {
+            AudioLibrary library = AudioLibrary.Scan(folder, AudioIndexPath);
+            library.TrySaveIndex(out _);
+
+            return (library, null);
+        } catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException) {
+            return (AudioLibrary.Empty, ex.Message);
+        }
+    }
+
+    private void UpdateVoiceSummary() {
+        if (_pendingVoiceFolders.Count == 0) {
+            _lblVoiceSummary.Text = _audioLibrary.FileCount > 0
+                ? "No voice clips - original audio only"
+                : "No audio library yet - add packs to the Audio folder";
+            _lblVoiceSummary.ForeColor = Theme.MutedText;
+            return;
+        }
+
+        int clips = _audioLibrary.FilesUnder(_pendingVoiceFolders).Count;
+        string folders = _pendingVoiceFolders.Count == 1
+            ? Path.GetFileName(_pendingVoiceFolders[0]) is { Length: > 0 } name ? name : "All audio"
+            : $"{_pendingVoiceFolders.Count} folders";
+
+        _lblVoiceSummary.Text = $"{folders} · {clips} clips";
+        _lblVoiceSummary.ForeColor = clips > 0 ? Theme.Text : Theme.MissingValue;
+        _toolTip.SetToolTip(_lblVoiceSummary, string.Join(Environment.NewLine, _pendingVoiceFolders));
+    }
+
+    private void BtnChooseVoice_Click(object? sender, EventArgs e) {
+        using var picker = new AudioFolderPickerForm(
+            _audioLibrary,
+            _pendingVoiceFolders,
+            RescanForPicker,
+            () => OpenFolder(AudioFolder, "Audio folder"));
+
+        DialogResult result = picker.ShowDialog(this);
+
+        // Kept even on Cancel: a rescan inside the dialog is still the newest view of the disk.
+        _audioLibrary = picker.Library;
+
+        if (result == DialogResult.OK) _pendingVoiceFolders = [.. picker.SelectedFolders];
+
+        UpdateVoiceSummary();
+    }
+
+    private AudioLibrary RescanForPicker() {
+        (AudioLibrary library, string? error) = ScanAudioLibrary(AudioFolder);
+
+        if (error is not null) {
+            _logger.Log($"Could not read the audio library in {AudioFolder}: {error}", LogLevel.Warning);
+        }
+
+        return library;
+    }
+
+    private void BtnClearVoice_Click(object? sender, EventArgs e) {
+        _pendingVoiceFolders = [];
+        UpdateVoiceSummary();
+    }
+
+    /// <summary>The injected-audio settings as the group shows them, or null for none.</summary>
+    private VoiceInjection? ReadVoiceControls() {
+        if (_pendingVoiceFolders.Count == 0) return null;
+
+        double minGap = (double)_numGapMin.Value;
+        double maxGap = (double)_numGapMax.Value;
+
+        return new VoiceInjection {
+            Folders = [.. _pendingVoiceFolders],
+            VoiceVolumePercent = (int)_numVoiceVolume.Value,
+            OriginalVolumePercent = (int)_numOriginalVolume.Value,
+            // Swapped rather than rejected when entered the wrong way round.
+            MinGapSeconds = Math.Min(minGap, maxGap),
+            MaxGapSeconds = Math.Max(minGap, maxGap)
+        };
+    }
+
+    private void BtnApplyVoice_Click(object? sender, EventArgs e) {
+        if (SelectedVideo is not { } settings) return;
+
+        settings.Voice = ReadVoiceControls();
+
+        RefreshVideoList();
+        _logger.Log(settings.Voice is null
+            ? $"Injected audio cleared for {RowLabel(settings)}"
+            : $"Injected audio saved for {RowLabel(settings)}");
+    }
+
+    private void BtnApplyVoiceAll_Click(object? sender, EventArgs e) {
+        if (_videoSettings.Count == 0) return;
+
+        VoiceInjection? voice = ReadVoiceControls();
+
+        // A copy each, so applying to one video later cannot reach into the others.
+        foreach (VideoSegmentSettings settings in _videoSettings) settings.Voice = voice?.Clone();
+
+        RefreshVideoList();
+        _logger.Log(voice is null
+            ? $"Injected audio cleared for all {_videoSettings.Count} videos"
+            : $"Injected audio saved for all {_videoSettings.Count} videos");
+    }
+
     private async void BtnStart_Click(object? sender, EventArgs e) {
         MergeOptions options = ReadOptions();
 
@@ -508,7 +820,7 @@ public sealed partial class MainForm : Form
             // objects inside it stay reachable from the UI thread, which can still edit them
             // mid-job through Apply to Selected Video.
             var coordinator = new MergeCoordinator(
-                _logger, options, [.. _videoSettings.Select(s => s.Clone())]);
+                _logger, options, [.. _videoSettings.Select(s => s.Clone())], audio: _audioLibrary);
 
             await coordinator.RunAsync(new Progress<MergeProgress>(ApplyProgress), _jobCancellation.Token);
         } catch (OperationCanceledException) {
@@ -546,6 +858,10 @@ public sealed partial class MainForm : Form
 
         SaveSettings();
         ApplySettingsToUi();
+
+        if (!string.Equals(previous.AudioFolder, _settings.AudioFolder, StringComparison.OrdinalIgnoreCase)) {
+            StartAudioScan();
+        }
 
         // Only rescan when the answer could have changed; a rescan drops the trim settings of
         // any file that is no longer there.
@@ -779,6 +1095,7 @@ public sealed partial class MainForm : Form
         if (disposing) {
             // ToolTip is a component, not a child control, so the form will not collect it.
             _toolTip.Dispose();
+            _videoMenu.Dispose();
             _detailScan?.Dispose();
             _jobCancellation?.Dispose();
             _logFont?.Dispose();

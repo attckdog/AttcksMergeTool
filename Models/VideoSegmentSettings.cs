@@ -19,6 +19,21 @@ public sealed class VideoSegmentSettings
     public bool UseTrim { get; set; }
 
     /// <summary>
+    /// Whether the video is merged at all. A disabled video is left out of the encode, and its
+    /// funscripts with it, so the merged script cannot describe a scene the video does not have.
+    /// </summary>
+    /// <remarks>
+    /// Held here rather than by row or by position so it travels with the video through every
+    /// reorder - shuffling the list moves these objects, it does not rebuild them.
+    /// </remarks>
+    public bool Enabled { get; set; } = true;
+
+    /// <summary>
+    /// Random voice clips to mix over this video's audio, or <c>null</c> to leave its audio alone.
+    /// </summary>
+    public VoiceInjection? Voice { get; set; }
+
+    /// <summary>
     /// An independent copy. A running job takes one of these per video so the UI thread
     /// cannot change a trim out from under it via <c>Apply to Selected Video</c>.
     /// </summary>
@@ -26,7 +41,9 @@ public sealed class VideoSegmentSettings
         FilePath = FilePath,
         StartTime = StartTime,
         EndTime = EndTime,
-        UseTrim = UseTrim
+        UseTrim = UseTrim,
+        Enabled = Enabled,
+        Voice = Voice?.Clone()
     };
 
     /// <summary>Drives the display text in the video list box.</summary>

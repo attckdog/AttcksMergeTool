@@ -227,6 +227,98 @@ public class VideoMergerTests
         Assert.False(File.Exists(options.ConcatListFile));
     }
 
+    /// <remarks>
+    /// Each source is probed for audio, and only the mute one has its track generated.
+    /// </remarks>
+    [Fact]
+    public async Task A_source_without_audio_is_encoded_with_silence() {
+        using var workspace = new TempWorkspace();
+        MergeOptions options = workspace.Options(nameof(A_source_without_audio_is_encoded_with_silence));
+        var runner = new FakeProcessRunner();
+
+        await Merge(workspace, options, runner, Probe(2000, 3000).WithoutAudio("B.mp4"), ["A.mp4", "B.mp4"]);
+
+        Assert.Contains("[0:a]", GraphFor(runner, "A.mp4"));
+        Assert.DoesNotContain("[0:a]", GraphFor(runner, "B.mp4"));
+        Assert.Contains("anullsrc", GraphFor(runner, "B.mp4"));
+    }
+
+    [Fact]
+    public async Task A_video_with_voice_folders_gets_a_voice_track_mixed_in() {
+        using var workspace = new TempWorkspace();
+        MergeOptions options = workspace.Options(nameof(A_video_with_voice_folders_gets_a_voice_track_mixed_in));
+        var runner = new FakeProcessRunner();
+        AudioLibrary library = VoiceLibrary(workspace, "one.mp3", "two.mp3");
+        FakeMediaProbe probe = Probe(60_000, 60_000)
+            .WithDuration("A.mp4", 60_000)
+            .WithDuration("one.mp3", 3000)
+            .WithDuration("two.mp3", 4000);
+
+        await Merge(workspace, options, runner, probe, ["A.mp4", "B.mp4"],
+            trims: [VoiceFor(workspace, "A.mp4", volume: 80, original: 50)], audio: library);
+
+        FakeProcessRunner.Invocation track = runner.Invocations.Single(invocation => invocation.Arguments[^1].EndsWith("0001_voice1.wav"));
+        Assert.Contains(track.Arguments, argument => argument.EndsWith("one.mp3") || argument.EndsWith("two.mp3"));
+
+        int trackRun = runner.Invocations.ToList().IndexOf(track);
+        int encodeRun = runner.Invocations.ToList().FindIndex(invocation => invocation.Arguments[^1].EndsWith("0001.mkv"));
+        Assert.True(trackRun < encodeRun);
+
+        Assert.Contains(track.Arguments[^1], runner.Invocations[encodeRun].Arguments);
+        Assert.Contains("volume=0.8", GraphFor(runner, "A.mp4"));
+        Assert.Contains("volume=0.5[base]", GraphFor(runner, "A.mp4"));
+
+        // The other video was given no folders, so its encode is exactly what it always was.
+        Assert.DoesNotContain("amix", GraphFor(runner, "B.mp4"));
+    }
+
+    [Fact]
+    public async Task A_voice_folder_with_no_clips_leaves_the_audio_alone_and_says_so() {
+        using var workspace = new TempWorkspace();
+        MergeOptions options = workspace.Options(nameof(A_voice_folder_with_no_clips_leaves_the_audio_alone_and_says_so));
+        var runner = new FakeProcessRunner();
+        var logger = new FakeJobLogger();
+        AudioLibrary library = VoiceLibrary(workspace, "one.mp3");
+
+        VideoSegmentSettings settings = VoiceFor(workspace, "A.mp4", volume: 100, original: 100);
+        settings.Voice!.Folders = ["Gone"];
+
+        await Merge(workspace, options, runner, Probe(5000).WithDuration("A.mp4", 5000), ["A.mp4"],
+            logger: logger, trims: [settings], audio: library);
+
+        Assert.DoesNotContain("amix", GraphFor(runner, "A.mp4"));
+        Assert.True(logger.WarnedAbout("Gone"));
+    }
+
+    private static AudioLibrary VoiceLibrary(TempWorkspace workspace, params string[] clips) {
+        foreach (string clip in clips) {
+            string path = workspace.Path(Path.Combine("Audio", "Pack", clip));
+            Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+            File.WriteAllText(path, "clip");
+        }
+
+        return AudioLibrary.Scan(workspace.Path("Audio"));
+    }
+
+    private static VideoSegmentSettings VoiceFor(TempWorkspace workspace, string videoName, int volume, int original) => new() {
+        FilePath = workspace.Path(videoName),
+        Voice = new VoiceInjection {
+            Folders = ["Pack"],
+            VoiceVolumePercent = volume,
+            OriginalVolumePercent = original,
+            MinGapSeconds = 1,
+            MaxGapSeconds = 2
+        }
+    };
+
+    private static string GraphFor(FakeProcessRunner runner, string sourceName) {
+        IReadOnlyList<string> arguments = runner.Invocations
+            .Single(invocation => invocation.Arguments.Any(argument => argument.EndsWith(sourceName, StringComparison.Ordinal)))
+            .Arguments;
+
+        return arguments[arguments.ToList().IndexOf("-filter_complex") + 1];
+    }
+
     private static FakeMediaProbe Probe(params int?[] segmentDurations) {
         var probe = new FakeMediaProbe();
 
@@ -271,10 +363,13 @@ public class VideoMergerTests
         FakeMediaProbe probe,
         string[] videoNames,
         FunscriptMergeResult? scriptResult = null,
-        FakeJobLogger? logger = null) {
+        FakeJobLogger? logger = null,
+        IReadOnlyList<VideoSegmentSettings>? trims = null,
+        AudioLibrary? audio = null) {
         List<string> videos = [.. videoNames.Select(workspace.WriteVideo)];
 
-        var merger = new VideoMerger(logger ?? new FakeJobLogger(), options, TrimLookup.Empty, runner, probe);
+        var merger = new VideoMerger(
+            logger ?? new FakeJobLogger(), options, trims is null ? TrimLookup.Empty : new TrimLookup(trims), runner, probe, audio);
 
         return await merger.MergeAsync(videos, scriptResult);
     }

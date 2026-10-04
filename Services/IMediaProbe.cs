@@ -1,4 +1,4 @@
-namespace AttcksMergeTool.Services;
+﻿namespace AttcksMergeTool.Services;
 
 /// <summary>Reads properties of a media file.</summary>
 /// <remarks>
@@ -12,4 +12,11 @@ public interface IMediaProbe
     /// not be determined.
     /// </summary>
     Task<int?> GetDurationMsAsync(string filePath, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Whether <paramref name="filePath"/> has at least one audio stream. <c>true</c> when it
+    /// could not be determined, so an unreadable file fails in ffmpeg with a real error rather
+    /// than being silently encoded as a mute one.
+    /// </summary>
+    Task<bool> HasAudioAsync(string filePath, CancellationToken cancellationToken = default);
 }

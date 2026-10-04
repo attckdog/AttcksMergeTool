@@ -1,4 +1,4 @@
-using AttcksMergeTool.Models;
+﻿using AttcksMergeTool.Models;
 using AttcksMergeTool.Services;
 
 namespace AttcksMergeTool.Tests.Support;
@@ -68,6 +68,7 @@ internal sealed class FakeProcessRunner : IProcessRunner
 internal sealed class FakeMediaProbe : IMediaProbe
 {
     private readonly Dictionary<string, int?> _durations = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> _mute = new(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>What to report for a file no test set up. Null means "could not be read".</summary>
     public int? DefaultDurationMs { get; set; }
@@ -83,6 +84,18 @@ internal sealed class FakeMediaProbe : IMediaProbe
         string name = Path.GetFileName(filePath);
 
         return Task.FromResult(_durations.TryGetValue(name, out int? duration) ? duration : DefaultDurationMs);
+    }
+
+    /// <summary>Marks a file as having no audio stream. Every other file has one.</summary>
+    public FakeMediaProbe WithoutAudio(string fileName) {
+        _mute.Add(fileName);
+        return this;
+    }
+
+    public Task<bool> HasAudioAsync(string filePath, CancellationToken cancellationToken = default) {
+        cancellationToken.ThrowIfCancellationRequested();
+
+        return Task.FromResult(!_mute.Contains(Path.GetFileName(filePath)));
     }
 }
 

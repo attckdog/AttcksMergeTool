@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using AttcksMergeTool.Models;
 using AttcksMergeTool.Services;
 
@@ -15,11 +16,22 @@ public sealed partial class OptionsForm : Form
 
     private readonly AppSettings _settings;
 
+    /// <summary>Set while a pack is being sorted, which the dialog must not close under.</summary>
+    private bool _sorting;
+
     public OptionsForm(AppSettings settings) {
         _settings = settings.Clone();
 
         BuildUi();
         LoadFrom(_settings);
+        SuggestSortFolders(_settings.AudioFolder);
+
+        FormClosing += (_, e) => {
+            if (!_sorting) return;
+
+            e.Cancel = true;
+            SetSortStatus("Wait for the sort to finish before closing Options.", Theme.ForLogLevel(LogLevel.Warning));
+        };
     }
 
     /// <summary>
@@ -119,6 +131,159 @@ public sealed partial class OptionsForm : Form
         _lblToolStatus.ForeColor = colour;
     }
 
+    /// <summary>
+    /// Plans the sort, and with <paramref name="apply"/> builds it after a confirmation. The
+    /// work runs off the UI thread: planning reads every clip to find duplicates.
+    /// </summary>
+    private async Task SortAudioAsync(bool apply) {
+        string source, destination;
+
+        try {
+            source = MergeOptions.ResolvePath(_txtSortSource.Text);
+            destination = MergeOptions.ResolvePath(_txtSortDestination.Text);
+        } catch (ArgumentException) {
+            SetSortStatus("One of the folders is not a valid path.", Theme.ForLogLevel(LogLevel.Error));
+            return;
+        }
+
+        if (!Directory.Exists(source)) {
+            SetSortStatus($"Pack folder not found: {source}", Theme.ForLogLevel(LogLevel.Error));
+            return;
+        }
+
+        // Inside the pack is fine - the plan leaves the sorted folder out of its scan - but the
+        // pack folder itself would mix sorted links in among the originals.
+        if (SameFolder(source, destination)) {
+            SetSortStatus("The sorted folder must be different from the pack folder.", Theme.ForLogLevel(LogLevel.Error));
+            return;
+        }
+
+        var progress = new Progress<string>(message => SetSortStatus(message, Theme.MutedText));
+        SetSorting(true);
+
+        try {
+            AudioSortPlan plan = await Task.Run(() => AudioSorter.Plan(source, destination, progress));
+            _txtSortSummary.Text = DescribePlan(plan, destination);
+
+            if (plan.SortedCount == 0) {
+                SetSortStatus("No audio clips found in that folder.", Theme.ForLogLevel(LogLevel.Warning));
+                return;
+            }
+
+            if (!apply) {
+                SetSortStatus($"Preview: {plan.SortedCount:N0} clips would be sorted, {plan.SkippedCount:N0} skipped. Nothing was written.",
+                    Theme.ForLogLevel(LogLevel.Info));
+                return;
+            }
+
+            DialogResult confirmation = MessageBox.Show(
+                this,
+                $"Sort {plan.SortedCount:N0} clips into {destination}?\n\n"
+                + $"{plan.SkippedCount:N0} duplicates are left out. The pack itself is not changed.",
+                "Sort Pack",
+                MessageBoxButtons.OKCancel,
+                MessageBoxIcon.Question);
+
+            if (confirmation != DialogResult.OK) {
+                SetSortStatus("Sort cancelled. Nothing was written.", Theme.MutedText);
+                return;
+            }
+
+            AudioSortResult result = await Task.Run(() => AudioSorter.Apply(plan, destination, progress));
+
+            string copies = result.Copied > 0 ? $", {result.Copied:N0} copied (another drive)" : string.Empty;
+            SetSortStatus(
+                $"Done: {result.Linked:N0} linked{copies}, {result.AlreadyThere:N0} already there. "
+                + "Use Rescan in the audio folder picker to see them.",
+                Theme.ForLogLevel(LogLevel.Success));
+        } catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) {
+            SetSortStatus($"Sorting failed: {ex.Message}", Theme.ForLogLevel(LogLevel.Error));
+        } finally {
+            SetSorting(false);
+        }
+    }
+
+    private static string DescribePlan(AudioSortPlan plan, string destination) {
+        var text = new System.Text.StringBuilder();
+
+        text.AppendLine($"{plan.Entries.Count:N0} clips: {plan.SortedCount:N0} sorted, {plan.SkippedCount:N0} skipped");
+        foreach ((string reason, int count) in plan.SkipCounts) text.AppendLine($"  skipped {count,5:N0}  {reason.TrimEnd()}");
+
+        text.AppendLine().AppendLine($"Into {destination}:");
+        foreach ((string folder, int count) in plan.FolderCounts) text.AppendLine($"  {count,5:N0}  {folder.Replace('/', '\\')}");
+
+        return text.ToString();
+    }
+
+    private static bool SameFolder(string first, string second) =>
+        Path.TrimEndingDirectorySeparator(Path.GetFullPath(first))
+            .Equals(Path.TrimEndingDirectorySeparator(Path.GetFullPath(second)), StringComparison.OrdinalIgnoreCase);
+
+    private void SetSorting(bool sorting) {
+        _sorting = sorting;
+        _btnSortPreview.Enabled = !sorting;
+        _btnSortRun.Enabled = !sorting;
+        _btnOk.Enabled = !sorting;
+        _btnCancel.Enabled = !sorting;
+        UseWaitCursor = sorting;
+    }
+
+    private void SetSortStatus(string message, Color colour) {
+        _lblSortStatus.Text = message;
+        _lblSortStatus.ForeColor = colour;
+    }
+
+    /// <summary>
+    /// Starts the sorting page on the OpenNSFW pack when it is in the audio library, sorting
+    /// into a "Sorted" folder beside it so the result can be picked straight away.
+    /// </summary>
+    private void SuggestSortFolders(string audioFolder) {
+        string library;
+
+        try {
+            library = MergeOptions.ResolvePath(audioFolder);
+        } catch (ArgumentException) {
+            return;
+        }
+
+        string pack = Path.Combine(library, "OpenNSFW VA");
+
+        _txtSortSource.Text = Directory.Exists(pack) ? pack : library;
+        _txtSortDestination.Text = Path.Combine(library, AudioSorter.DefaultFolderName);
+    }
+
+    /// <summary>Opens <paramref name="url"/> in the default browser.</summary>
+    private void OpenLink(string url) {
+        try {
+            // Shell execute, because a URL is not something to run - the shell hands it to
+            // whatever browser is registered for it.
+            using Process? process = Process.Start(new ProcessStartInfo(url) { UseShellExecute = true });
+        } catch (Exception ex) when (ex is InvalidOperationException
+                                         or System.ComponentModel.Win32Exception) {
+            MessageBox.Show(
+                this,
+                $"Could not open {url}: {ex.Message}",
+                "Options",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Warning);
+        }
+    }
+
+    /// <summary>The GPL text embedded from the repository's LICENSE file.</summary>
+    private static string ReadLicenseText() {
+        using Stream? stream = typeof(OptionsForm).Assembly.GetManifestResourceStream(LicenseResourceName);
+
+        if (stream is null) return $"The license text is missing from this build. See {LicenseUrl}";
+
+        using var reader = new StreamReader(stream);
+
+        // A multiline TextBox only breaks on CRLF, and the file may be checked out with LF.
+        return reader.ReadToEnd().ReplaceLineEndings("\r\n");
+    }
+
+    /// <summary>The version without the "+commit" suffix the SDK appends to it.</summary>
+    private static string DisplayVersion() => Application.ProductVersion.Split('+')[0];
+
     private static string ExistingFolder(string path) {
         try {
             string resolved = MergeOptions.ResolvePath(path);
@@ -133,6 +298,7 @@ public sealed partial class OptionsForm : Form
 
     private void LoadFrom(AppSettings settings) {
         _txtInputFolder.Text = settings.InputFolder;
+        _txtAudioFolder.Text = settings.AudioFolder;
         _chkIncludeSubfolders.Checked = settings.IncludeInputSubfolders;
         _txtTempFolder.Text = settings.TempFolder;
         _txtOutputFolder.Text = settings.OutputFolder;
@@ -175,6 +341,7 @@ public sealed partial class OptionsForm : Form
     /// </summary>
     private void ApplyTo(AppSettings settings) {
         settings.InputFolder = _txtInputFolder.Text;
+        settings.AudioFolder = _txtAudioFolder.Text;
         settings.IncludeInputSubfolders = _chkIncludeSubfolders.Checked;
         settings.TempFolder = _txtTempFolder.Text;
         settings.OutputFolder = _txtOutputFolder.Text;

@@ -18,6 +18,12 @@ public sealed partial class OptionsForm
     /// </summary>
     private const int InputWidth = 340;
 
+    private const string RepositoryUrl = "https://github.com/attckdog/AttcksMergeTool";
+    private const string LicenseUrl = "https://www.gnu.org/licenses/gpl-3.0.html";
+
+    /// <summary>The LogicalName the project file gives the embedded LICENSE.</summary>
+    private const string LicenseResourceName = "AttcksMergeTool.LICENSE";
+
     private readonly ListBox _categories = new() {
         Dock = DockStyle.Fill,
         BorderStyle = BorderStyle.None,
@@ -37,6 +43,7 @@ public sealed partial class OptionsForm
     private readonly TextBox _txtOutputFolder = NewTextBox();
     private readonly TextBox _txtConcatListFile = NewTextBox();
     private readonly TextBox _txtChapterMetadataFile = NewTextBox();
+    private readonly TextBox _txtAudioFolder = NewTextBox();
     private readonly TextBox _txtFfmpegPath = NewTextBox();
     private readonly TextBox _txtFfprobePath = NewTextBox();
 
@@ -87,6 +94,34 @@ public sealed partial class OptionsForm
     private readonly CheckBox _chkWarnOverwrite = NewCheckBox("Warn before overwriting an existing output");
     private readonly NumericUpDown _numLogFontSize = NewNumeric(6, 24);
 
+    // --- Audio sorting ---
+
+    private readonly TextBox _txtSortSource = NewTextBox();
+    private readonly TextBox _txtSortDestination = NewTextBox();
+    private readonly Button _btnSortPreview = NewSmallButton("Preview");
+    private readonly Button _btnSortRun = NewButton("Sort Pack", Theme.PrimaryAction);
+
+    private readonly Label _lblSortStatus = new() {
+        AutoSize = true,
+        ForeColor = Theme.MutedText,
+        Margin = new Padding(0, 4, 0, 4)
+    };
+
+    /// <summary>The plan or result, folder by folder. Fixed height, since it can run to a hundred lines.</summary>
+    private readonly TextBox _txtSortSummary = new() {
+        Multiline = true,
+        ReadOnly = true,
+        WordWrap = false,
+        ScrollBars = ScrollBars.Both,
+        Height = 260,
+        Dock = DockStyle.Fill,
+        Font = Theme.LogFont,
+        BackColor = Theme.Well,
+        ForeColor = Theme.Text,
+        BorderStyle = BorderStyle.FixedSingle,
+        Margin = new Padding(0, 4, 6, 4)
+    };
+
     // --- Buttons ---
 
     private readonly Button _btnOk = NewButton("OK", Theme.ConfirmAction);
@@ -127,6 +162,8 @@ public sealed partial class OptionsForm
         AddPage("Encoding", BuildEncodingPage());
         AddPage("Merge", BuildMergePage());
         AddPage("Application", BuildApplicationPage());
+        AddPage("Audio Sorting", BuildAudioSortingPage());
+        AddPage("Credits & License", BuildCreditsPage());
 
         ConfigureToolTips();
 
@@ -192,6 +229,11 @@ public sealed partial class OptionsForm
         AddRow(grid, "Temp folder:", _txtTempFolder, BrowseFolderButton(_txtTempFolder));
         AddRow(grid, "Output folder:", _txtOutputFolder, BrowseFolderButton(_txtOutputFolder));
         AddHint(grid, "Leave the output folder blank to write beside the application.");
+
+        AddRow(grid, "Audio library folder:", _txtAudioFolder, BrowseFolderButton(_txtAudioFolder));
+        AddHint(grid,
+            "Voice packs dropped in here can be mixed into any video's audio. Every folder "
+            + "beneath it can be picked from, so packs can keep their own layout.");
 
         AddRow(grid, "Concat list file:", _txtConcatListFile);
         AddRow(grid, "Chapter metadata file:", _txtChapterMetadataFile);
@@ -280,6 +322,182 @@ public sealed partial class OptionsForm
         page.Controls.Add(grid);
 
         return page;
+    }
+
+    /// <summary>A tool rather than settings: nothing on this page is saved by OK.</summary>
+    private Panel BuildAudioSortingPage() {
+        Panel page = NewPage();
+        TableLayoutPanel grid = NewGrid();
+
+        _btnSortPreview.Click += async (_, _) => await SortAudioAsync(apply: false);
+        _btnSortRun.Click += async (_, _) => await SortAudioAsync(apply: true);
+        _btnSortRun.Margin = new Padding(0, 4, 4, 4);
+
+        AddFullWidthRow(grid, NewMutedLabel(
+            "Sorts a voice pack into Voice / Category / Intensity folders, such as "
+            + "Female\\Moaning\\3-High, by reading its folder and file names. Tuned for the "
+            + "OpenNSFW VA pack."));
+
+        AddRow(grid, "Pack to sort:", _txtSortSource, BrowseFolderButton(_txtSortSource));
+        AddRow(grid, "Sorted folder:", _txtSortDestination, BrowseFolderButton(_txtSortDestination));
+        AddHint(grid,
+            "The pack itself is not changed. The sorted folder holds hard links to its clips, so "
+            + "they take no extra space; on another drive they are copied instead. Raw takes that "
+            + "have a processed version, and exact duplicates, are left out. Sorting again only "
+            + "adds clips that aren't there yet.");
+
+        AddRow(grid, string.Empty, Trailing(_btnSortRun, _btnSortPreview));
+        AddFullWidthRow(grid, _lblSortStatus);
+        AddRow(grid, "Result:", _txtSortSummary);
+
+        page.Controls.Add(grid);
+
+        return page;
+    }
+
+    /// <summary>
+    /// A single column rather than the caption/input grid, since nothing here is a setting.
+    /// The license is laid out at its full height so the page has one scrollbar, not a
+    /// scrolling text box nested inside a scrolling page.
+    /// </summary>
+    private Panel BuildCreditsPage() {
+        Panel page = NewPage();
+        var stack = new TableLayoutPanel {
+            Dock = DockStyle.Top,
+            AutoSize = true,
+            AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            ColumnCount = 1,
+            Padding = new Padding(0, 0, 20, 0)
+        };
+
+        stack.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+
+        AddStackRow(stack, new Label {
+            Text = "Attck's Funscript & Video Merger",
+            AutoSize = true,
+            Font = new Font(Font.FontFamily, 13F, FontStyle.Bold),
+            Margin = new Padding(0, 4, 0, 0)
+        });
+        AddStackRow(stack, NewMutedLabel($"Version {DisplayVersion()}"));
+        AddStackRow(stack, NewLink("Created by attckdog", RepositoryUrl));
+
+        AddStackRow(stack, NewHeading("Credits"));
+        AddCredit(stack, "FFmpeg", "https://ffmpeg.org/",
+            "ffmpeg and ffprobe do all of the encoding, joining and measuring. Not bundled: they "
+            + "are installed separately and licensed by the FFmpeg developers under the LGPL "
+            + "or GPL, depending on the build.");
+        AddCredit(stack, ".NET and Windows Forms", "https://dotnet.microsoft.com/",
+            "The runtime and UI framework, by Microsoft and the .NET Foundation, under the MIT License.");
+
+        AddStackRow(stack, NewHeading("Voice Pack"));
+        AddCredit(stack, $"{VoicePackCredits.PackName}: @{VoicePackCredits.PackHandle}", VoicePackCredits.PackUrl,
+            "Voice clips for injected audio come from the OpenNSFW Voice Pack, used under the Creative "
+            + "Commons Attribution 4.0 International License. Thank you to every performer below. The "
+            + "clips must not be used to train AI or to imitate a performer's voice.");
+        AddStackRow(stack, NewLink("Creative Commons Attribution 4.0", VoicePackCredits.PackLicenseUrl));
+        AddCreditGroup(stack, "Female VA Pack", VoicePackCredits.Female);
+        AddCreditGroup(stack, "Male VA Pack", VoicePackCredits.Male);
+        AddCreditGroup(stack, "Sound editing (Hoshinomeririri pack)", VoicePackCredits.Editors);
+
+        AddStackRow(stack, NewHeading("License"));
+        AddStackRow(stack, NewMutedLabel(
+            "Copyright (C) 2025 attckdog. This program is free software: you can redistribute it "
+            + "and/or modify it under the terms of the GNU General Public License as published by "
+            + "the Free Software Foundation, either version 3 of the License, or (at your option) "
+            + "any later version. It is distributed in the hope that it will be useful, but "
+            + "WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or "
+            + "FITNESS FOR A PARTICULAR PURPOSE."));
+        AddStackRow(stack, NewLink("GNU General Public License v3.0", LicenseUrl));
+
+        string license = ReadLicenseText();
+
+        // Sized to the text rather than docked, so it never scrolls by itself. The text is
+        // hard-wrapped already, so turning word wrap off keeps the measured size exact.
+        Size textSize = TextRenderer.MeasureText(license, Theme.LogFont);
+
+        AddStackRow(stack, new TextBox {
+            Text = license,
+            Multiline = true,
+            ReadOnly = true,
+            WordWrap = false,
+            ScrollBars = ScrollBars.None,
+            Size = new Size(textSize.Width + 12, textSize.Height + 12),
+            Anchor = AnchorStyles.Left,
+            Font = Theme.LogFont,
+            // Set explicitly: a read-only TextBox otherwise falls back to the light system grey.
+            BackColor = Theme.Well,
+            ForeColor = Theme.Text,
+            BorderStyle = BorderStyle.FixedSingle,
+            Margin = new Padding(0, 8, 0, 4)
+        });
+
+        page.Controls.Add(stack);
+
+        return page;
+    }
+
+    private void AddCredit(TableLayoutPanel stack, string name, string url, string description) {
+        AddStackRow(stack, NewLink(name, url));
+        AddStackRow(stack, NewMutedLabel(description));
+    }
+
+    /// <summary>A caption over the handles as links, flowed side by side to keep the page short.</summary>
+    private void AddCreditGroup(TableLayoutPanel stack, string caption, IReadOnlyList<VoiceCredit> credits) {
+        AddStackRow(stack, NewMutedLabel(caption));
+
+        var flow = new FlowLayoutPanel {
+            AutoSize = true,
+            AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            MaximumSize = new Size(CaptionWidth + InputWidth, 0),
+            Margin = new Padding(0, 0, 0, 4)
+        };
+
+        foreach (VoiceCredit credit in credits) {
+            LinkLabel link = NewLink(credit.Display, credit.Url);
+            link.Margin = new Padding(0, 2, 14, 2);
+            flow.Controls.Add(link);
+        }
+
+        AddStackRow(stack, flow);
+    }
+
+    private static void AddStackRow(TableLayoutPanel stack, Control control) {
+        int row = stack.RowCount++;
+        stack.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        stack.Controls.Add(control, 0, row);
+    }
+
+    private Label NewHeading(string text) => new() {
+        Text = text,
+        AutoSize = true,
+        Font = new Font(Font, FontStyle.Bold),
+        Margin = new Padding(0, 16, 0, 2)
+    };
+
+    private static Label NewMutedLabel(string text) => new() {
+        Text = text,
+        AutoSize = true,
+        // As wide as a settings page's caption and input, so the text wraps to the same measure.
+        MaximumSize = new Size(CaptionWidth + InputWidth, 0),
+        ForeColor = Theme.MutedText,
+        Margin = new Padding(0, 2, 0, 4)
+    };
+
+    private LinkLabel NewLink(string text, string url) {
+        var link = new LinkLabel {
+            Text = text,
+            AutoSize = true,
+            LinkColor = Theme.Link,
+            VisitedLinkColor = Theme.Link,
+            ActiveLinkColor = Theme.Text,
+            LinkBehavior = LinkBehavior.HoverUnderline,
+            Margin = new Padding(0, 6, 0, 0)
+        };
+
+        link.LinkClicked += (_, _) => OpenLink(url);
+        _toolTip.SetToolTip(link, url);
+
+        return link;
     }
 
     // --- Row and control construction ---
@@ -451,6 +669,7 @@ public sealed partial class OptionsForm
 
     private void ConfigureToolTips() {
         _toolTip.SetToolTip(_txtInputFolder, "The folder scanned for source videos and funscripts.");
+        _toolTip.SetToolTip(_txtAudioFolder, "The folder of voice clips that can be injected into a video's audio.");
         _toolTip.SetToolTip(_chkIncludeSubfolders, "Scans the input folder and every folder underneath it, instead of its top level only. A video is paired with the funscript of its own name wherever that sits, so files with the same name in different folders are reported as ambiguous.");
         _toolTip.SetToolTip(_txtTempFolder, "Where the normalized per-video segments are written before they are joined.");
         _toolTip.SetToolTip(_txtOutputFolder, "Where the merged video and funscript are written. Blank means beside the application.");
@@ -484,6 +703,11 @@ public sealed partial class OptionsForm
         _toolTip.SetToolTip(_chkRefreshOnLaunch, "Scans the input folder as soon as the app opens. Turn off if the folder is slow to read.");
         _toolTip.SetToolTip(_chkWarnOverwrite, "Asks for confirmation when a run is about to replace an existing merged video or script.");
         _toolTip.SetToolTip(_numLogFontSize, "Point size of the job log's monospaced font.");
+
+        _toolTip.SetToolTip(_txtSortSource, "The voice pack folder to sort, for example Audio\\OpenNSFW VA. Laid out as Female or Male, then one folder per performer.");
+        _toolTip.SetToolTip(_txtSortDestination, "Where the sorted folders are built. Keep it inside the audio library folder so the clips can be picked.");
+        _toolTip.SetToolTip(_btnSortPreview, "Shows where every clip would go, without writing anything.");
+        _toolTip.SetToolTip(_btnSortRun, "Builds the sorted folders and writes _manifest.csv beside them, listing where each clip went and why any were skipped.");
 
         _toolTip.SetToolTip(_btnDefaults, "Resets every option on every page back to its default. Nothing is saved until OK.");
     }

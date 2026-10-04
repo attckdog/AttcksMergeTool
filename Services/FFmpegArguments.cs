@@ -22,11 +22,21 @@ public static class FFmpegArguments
     private static string TempSegmentFormat(bool useAv1) => useAv1 ? "matroska" : "mpegts";
 
     /// <summary>Transcodes one source video into a normalized segment ready for concat.</summary>
+    /// <param name="hasAudio">
+    /// False for a source with no audio stream. Its segment gets a silent track instead, since
+    /// the concat needs every segment to carry the same streams.
+    /// </param>
+    /// <param name="voice">
+    /// Voice tracks from <see cref="BuildVoiceTrack"/> to mix over the scene's own audio, or
+    /// <c>null</c> to leave it as it is.
+    /// </param>
     public static List<string> BuildEncode(
         string inputPath,
         string segmentPath,
         VideoSegmentSettings? trim,
-        MergeOptions options) {
+        MergeOptions options,
+        bool hasAudio = true,
+        VoiceMix? voice = null) {
         Encoder encoder = EncoderFor(options);
 
         // Options that must precede -i (seeking, hardware decode).
@@ -49,8 +59,12 @@ public static class FFmpegArguments
         var args = new List<string> { "-hide_banner", "-loglevel", "error" };
         args.AddRange(inputArgs);
         args.AddRange(["-i", inputPath]);
+
+        // Straight after the source: ffmpeg binds options to the file that follows them, so a
+        // voice input placed after the encoder arguments would take them as its own.
+        foreach (string track in voice?.TrackPaths ?? []) args.AddRange(["-i", track]);
+
         args.AddRange(encoder.VideoArgs);
-        args.AddRange(["-vf", videoFilter]);
 
         // The concat offsets each segment by its longest stream, so a source whose audio runs
         // short of its video leaves a hole in the merged audio track. Players close that hole
@@ -58,8 +72,118 @@ public static class FFmpegArguments
         // Padding with silence from the first frame on, then cutting at the video's end, makes
         // every segment's audio exactly as long as its video. -shortest has to come before the
         // output path, like every output option.
-        args.Add("-shortest");
-        args.AddRange(OutputArgs(encoder, segmentPath, options, "aresample=async=1:first_pts=0,apad"));
+        //
+        // Both chains share one -filter_complex graph rather than going in as -vf and -af.
+        // ffmpeg 8 deadlocks on aresample=async + apad in a separate audio graph whenever the
+        // source's audio has timestamp gaps (looped clips have one at every seam): the encode
+        // stops partway through at 0% CPU and never exits. The same filters in one graph run
+        // to completion.
+        //
+        // A source with no audio gets silence generated in the same graph; it is endless, so
+        // -shortest cuts it at the video's end just like the padding.
+        string audioChain = hasAudio
+            ? "[0:a]aresample=async=1:first_pts=0,apad"
+            : Silence(options);
+
+        audioChain = voice is { TrackPaths.Count: > 0 }
+            ? MixVoice(audioChain, voice)
+            : audioChain + "[a]";
+
+        args.AddRange([
+            "-filter_complex",
+            $"[0:v]{videoFilter}[v];{audioChain}",
+            "-map", "[v]",
+            "-map", "[a]",
+            "-shortest"
+        ]);
+        args.AddRange(OutputArgs(encoder, segmentPath, options, audioFilter: null));
+
+        return args;
+    }
+
+    /// <summary>
+    /// Mixes the voice tracks over <paramref name="baseChain"/>, the scene's own padded audio.
+    /// </summary>
+    /// <remarks>
+    /// The base is endless - padded or generated - so mixing for as long as it lasts leaves
+    /// -shortest to cut the result at the video's end exactly as it does without voices. The
+    /// tracks hold silence wherever no clip plays, so nothing is normalized: a voice must not
+    /// get quieter just because it shares the mix. The limiter only catches the peaks where a
+    /// loud clip lands on loud scene audio, and has its own auto-levelling switched off so it
+    /// never lifts anything, and its lookahead compensated so the audio stays on its frames.
+    /// </remarks>
+    private static string MixVoice(string baseChain, VoiceMix voice) {
+        var graph = new List<string> { $"{baseChain},volume={Volume(voice.OriginalVolumePercent)}[base]" };
+        string inputs = "[base]";
+
+        for (int index = 0; index < voice.TrackPaths.Count; index++) {
+            graph.Add($"[{index + 1}:a]volume={Volume(voice.VoiceVolumePercent)}[voice{index}]");
+            inputs += $"[voice{index}]";
+        }
+
+        graph.Add(
+            $"{inputs}amix=inputs={Number(voice.TrackPaths.Count + 1)}:duration=first:normalize=0,"
+            + "alimiter=limit=0.97:level=0:latency=1[a]");
+
+        return string.Join(';', graph);
+    }
+
+    /// <summary>
+    /// How many clips one voice track mixes at most. Each is an input on the command line,
+    /// which Windows caps at 32k characters; voice packs nest deep, and their paths are long.
+    /// </summary>
+    public const int MaxClipsPerVoiceTrack = 32;
+
+    /// <summary>
+    /// Renders <paramref name="placements"/> to one WAV track that starts at the scene's first
+    /// frame, each clip delayed to its place and silence everywhere else.
+    /// </summary>
+    /// <remarks>
+    /// Rendered ahead of the scene's encode rather than inside it so the encode takes a fixed
+    /// handful of inputs however many clips a long scene ends up with. Every clip is brought
+    /// to the output's layout first, since a pack mixes mono and stereo, 44.1 and 48 kHz.
+    /// </remarks>
+    public static List<string> BuildVoiceTrack(
+        IReadOnlyList<VoicePlacement> placements,
+        string outputPath,
+        MergeOptions options) {
+        if (placements.Count is 0 or > MaxClipsPerVoiceTrack) {
+            throw new ArgumentOutOfRangeException(
+                nameof(placements), placements.Count, $"A voice track takes 1 to {MaxClipsPerVoiceTrack} clips.");
+        }
+
+        var args = new List<string> { "-hide_banner", "-loglevel", "error" };
+
+        foreach (VoicePlacement placement in placements) args.AddRange(["-i", placement.Path]);
+
+        string format =
+            $"aformat=sample_fmts=fltp:sample_rates={Number(options.AudioSampleRate)}:"
+            + $"channel_layouts={ChannelLayout(options.AudioChannels)}";
+
+        var graph = new List<string>();
+        string inputs = string.Empty;
+
+        for (int index = 0; index < placements.Count; index++) {
+            graph.Add(
+                $"[{index}:a]asetpts=PTS-STARTPTS,{format},"
+                + $"adelay=delays={Number(placements[index].StartMs)}:all=1[clip{index}]");
+            inputs += $"[clip{index}]";
+        }
+
+        // Clips never overlap, so there is nothing to normalize: each plays at its own level.
+        graph.Add(placements.Count == 1
+            ? $"{inputs}anull[out]"
+            : $"{inputs}amix=inputs={Number(placements.Count)}:duration=longest:normalize=0[out]");
+
+        args.AddRange([
+            "-filter_complex", string.Join(';', graph),
+            "-map", "[out]",
+            "-c:a", "pcm_s16le",
+            "-ac", Number(options.AudioChannels),
+            "-ar", Number(options.AudioSampleRate),
+            "-f", "wav",
+            "-y", outputPath
+        ]);
 
         return args;
     }
@@ -93,8 +217,7 @@ public static class FFmpegArguments
             "-f", "lavfi",
             "-i", $"color=c=black:s={frameSize}:r={Number(options.TargetFps)}",
             "-f", "lavfi",
-            "-i", $"anullsrc=channel_layout={Number(options.AudioChannels)}c:"
-                + $"sample_rate={Number(options.AudioSampleRate)}"
+            "-i", Silence(options)
         ]);
 
         // Both sources are infinite, so the length has to be imposed on the output. -t rather
@@ -106,6 +229,11 @@ public static class FFmpegArguments
 
         return args;
     }
+
+    /// <summary>Endless silence in the output's audio layout.</summary>
+    private static string Silence(MergeOptions options) =>
+        $"anullsrc=channel_layout={Number(options.AudioChannels)}c:"
+        + $"sample_rate={Number(options.AudioSampleRate)}";
 
     /// <summary>
     /// Everything after the video filter, which every segment shares: frame rate, normalized
@@ -119,15 +247,17 @@ public static class FFmpegArguments
         Encoder encoder,
         string segmentPath,
         MergeOptions options,
-        string audioFilter) {
+        string? audioFilter) {
         var args = new List<string> {
             "-r", Number(options.TargetFps),
             "-c:a", "aac",
             "-b:a", options.AudioBitrate,
             "-ac", Number(options.AudioChannels),
-            "-ar", Number(options.AudioSampleRate),
-            "-af", audioFilter
+            "-ar", Number(options.AudioSampleRate)
         };
+
+        // Null when the caller already filtered the audio inside a -filter_complex graph.
+        if (audioFilter is not null) args.AddRange(["-af", audioFilter]);
 
         args.AddRange(encoder.BitstreamFilterArgs);
         args.AddRange(["-f", TempSegmentFormat(options.UseAv1), "-muxdelay", "0", "-y", segmentPath]);
@@ -218,4 +348,19 @@ public static class FFmpegArguments
     /// or separator would otherwise produce a command line ffmpeg cannot parse.
     /// </summary>
     private static string Number(int value) => value.ToString(CultureInfo.InvariantCulture);
+
+    /// <summary>A volume filter gain for a percentage, so 60 becomes 0.6.</summary>
+    private static string Volume(int percent) => (percent / 100.0).ToString("0.###", CultureInfo.InvariantCulture);
+
+    /// <summary>
+    /// The named layout for a channel count. A bare count ("2c") has no channel order, which
+    /// would not negotiate against the named layouts the decoders hand out.
+    /// </summary>
+    private static string ChannelLayout(int channels) => channels switch {
+        1 => "mono",
+        2 => "stereo",
+        6 => "5.1",
+        8 => "7.1",
+        _ => $"{Number(channels)}c"
+    };
 }

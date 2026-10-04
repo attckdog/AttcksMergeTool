@@ -53,6 +53,12 @@ public sealed class AppSettings
     public string OutputFolder { get; set; } = string.Empty;
 
     public string ConcatListFile { get; set; } = MergeOptions.DefaultConcatListFile;
+
+    /// <summary>
+    /// The voice clip library: packs dropped in here can be injected into any video's audio.
+    /// Relative to the executable, like every other folder.
+    /// </summary>
+    public string AudioFolder { get; set; } = AudioLibrary.DefaultFolder;
     public string ChapterMetadataFile { get; set; } = MergeOptions.DefaultChapterMetadataFile;
 
     // --- External tools ---
@@ -171,6 +177,7 @@ public sealed class AppSettings
         OutputFolder = (OutputFolder ?? string.Empty).Trim();
         ConcatListFile = Fallback(ConcatListFile, defaults.ConcatListFile);
         ChapterMetadataFile = Fallback(ChapterMetadataFile, defaults.ChapterMetadataFile);
+        AudioFolder = Fallback(AudioFolder, defaults.AudioFolder);
 
         FfmpegPath = Fallback(FfmpegPath, defaults.FfmpegPath);
         FfprobePath = Fallback(FfprobePath, defaults.FfprobePath);

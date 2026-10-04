@@ -23,6 +23,8 @@ the last.
   them.
 - **Per-video trimming**: cut the start or end off any video. Its script is trimmed to
   match.
+- **Injected voice audio**: mix random voice clips from your own audio packs over any
+  video's audio, with separate volumes for the voices and the original sound.
 - **Hardware encoding**: NVIDIA NVENC for AV1 or H.264, with software encoders as a
   fallback. Several scenes are encoded in parallel.
 - **Metadata kept**: creators, performers, tags and notes from every source script carry
@@ -75,14 +77,131 @@ The release is a single self-contained executable, so you don't need to install 
 4. **Trim (optional).** Select a video, tick **Enable Trimming**, enter the start and end
    times in seconds (an end of `0` keeps the rest of the video), and click
    **Apply to Selected Video**.
-5. **Name the output.** Enter an **Output Name**.
-6. **Merge.** Click **Start Merge**. The log shows each step: the scripts are merged
+5. **Inject audio (optional).** Select a video, click **Choose Folders...** in the
+   **Injected Audio** group, tick the voice folders to draw from, set the volumes and the
+   gap between clips, and click **Apply to Selected** or **Apply to All**. See
+   [Injected audio](#injected-audio).
+6. **Name the output.** Enter an **Output Name**.
+7. **Merge.** Click **Start Merge**. The log shows each step: the scripts are merged
    first, then each video is encoded, then everything is joined. Encoding is the slow
    part; longer videos take longer.
-7. **Collect the results.** When it finishes, **Open Export Folder** takes you to
+8. **Collect the results.** When it finishes, **Open Export Folder** takes you to
    `{Output Name}.mp4` and `{Output Name}.funscript`.
 
 You can **Cancel** a run at any time; temporary files are cleaned up either way.
+
+## Injected audio
+
+The app doesn't ship with any voice clips. Download a voice pack and put it in the `Audio`
+folder next to the app.
+
+### Getting the OpenNSFW voice pack
+
+The [OpenNSFW Voice Pack](https://x.com/OpenNSFWSP) is free, including for commercial work, as
+long as you credit the pack and its performers (see [Credits](#credits)).
+
+1. Get the pack from the official sources: [@OpenNSFWSP on X](https://x.com/OpenNSFWSP) or the
+   [OpenNSFW Discord](https://discord.gg/K53FpG4CBF).
+2. Extract it so the `OpenNSFW VA` folder sits inside `Audio`, next to the app:
+
+   ```
+   AttcksMergeTool.exe
+   Audio/
+     OpenNSFW VA/
+       Female/
+         728Kaya [Kaya]/...
+       Male/...
+       README - OpenNSFW Voice Pack Terms.pdf
+   ```
+
+3. Read `README - OpenNSFW Voice Pack Terms.pdf`. You agree to its terms by using the clips.
+4. Open the app. The library is scanned on launch. If the app was already open, click
+   **Rescan** in the folder picker.
+
+Other packs work the same way: give each pack its own folder under `Audio` and keep its folder
+layout. The app indexes every `.mp3`, `.wav`, `.ogg`, `.flac`, `.m4a`, `.opus`, `.aac` and
+`.wma` file in that folder and below it, and ignores everything else (PDFs, shortcuts,
+readmes).
+
+### Sorting a pack by sound type
+
+The pack is organized by performer, and every performer names their folders differently. To
+pick clips by type instead, for example "high-intensity female moans" across every performer,
+sort it:
+
+1. Open **Options... > Audio Sorting**. The pack and destination are filled in for you:
+   `Audio\OpenNSFW VA` and `Audio\Sorted`.
+2. Click **Preview** to see how many clips go in each folder. Nothing is written.
+3. Click **Sort Pack** and confirm.
+4. Click **Rescan** in the folder picker, then choose folders under `Sorted`.
+
+The sorted folder is laid out as `Voice/Category/Intensity`:
+
+```
+Audio/
+  Sorted/
+    Female/
+      Moaning/
+        1-Low/
+        2-Medium/
+        3-High/
+        4-Extreme/
+      Muffled Moaning/...
+      Breathing/...
+      Orgasm/...
+      Oral/...
+      Dialogue/...
+    Male/...
+    Femboy/...
+    Creature/
+      Orc/...
+      Werewolf/...
+```
+
+- **Voices**: Female, Male, Femboy, and Creature (split into Orc, Troll, Werewolf, Goblin,
+  Monster and Alien).
+- **Categories**: Moaning, Muffled Moaning (closed mouth, gagged, clenched teeth), Breathing,
+  Orgasm, Post-Orgasm, Oral, Kissing, Dialogue, Laughing, Pain & Struggle, Growls & Roars,
+  Sound Effects, Long Loops and Misc.
+- **Intensity** comes from words like "high intensity", "soft", "rough" or "fast". Pitch
+  ("High Pitch", "Deep voice") describes the voice, so it isn't counted as intensity. Clips
+  with no intensity clue sit directly in their category folder. Choosing a category folder
+  includes every level below it.
+- Each clip keeps its performer in its name, such as `728Kaya [Kaya] - open mouth high 1.mp3`,
+  so it can always be credited.
+
+The pack itself isn't changed. The sorted folder holds hard links to the original clips, so it
+takes no extra disk space. If the destination is on another drive, the clips are copied
+instead. Raw takes that also come in a processed version, and exact duplicates, are left out.
+Sorting again only adds clips that aren't there yet. `_manifest.csv` in the sorted folder
+records where every clip went and why any were skipped.
+
+The rules are tuned for the OpenNSFW pack. Other packs still sort, but expect more clips in
+Misc or without an intensity.
+
+### Mixing clips into a video
+
+For each video you choose one or more folders. A folder includes everything below it, so
+you can pick a whole pack, one voice actor, or one category. During the merge, clips are
+drawn at random from the chosen folders and placed one after another with a random gap
+between them, until the video (after trimming) runs out of room:
+
+- **Voice %**: how loud the clips play (100 = their own level).
+- **Original %**: how loud the video's own audio plays underneath. Lower it to let the
+  voices stand out.
+- **Gap min / max (s)**: the range the silence between two clips is picked from.
+
+Only whole clips are placed, so none are cut off at the end of a scene. A clip doesn't
+repeat until every clip in the chosen folders has played once. The log lists every clip
+that was used and when it starts. Videos with no folders chosen keep their audio exactly as
+it is.
+
+Clip lengths are measured the first time a clip is picked and saved in `audio-index.json`
+next to the app, so later runs don't measure them again. The library is scanned on launch.
+After adding packs, use **Rescan** in the folder picker. The library folder can be changed
+under **Options... > Paths & Tools**.
+
+Per-video audio choices, like trims, last until the app is closed.
 
 ## Multi-axis scripts
 
@@ -110,10 +229,12 @@ Open **Options...** to change:
 
 | Tab | Settings |
 |---|---|
-| Paths & Tools | Input, temp and output folders; whether to scan subfolders of the input folder; locations of `ffmpeg` and `ffprobe` if they aren't on your `PATH` |
+| Paths & Tools | Input, temp, output and audio library folders; whether to scan subfolders of the input folder; locations of `ffmpeg` and `ffprobe` if they aren't on your `PATH` |
 | Encoding | NVENC on/off, AV1 or H.264, quality and presets, target resolution (default 1920x1080), frame rate (default 60), number of parallel encodes, audio bitrate/channels/sample rate |
 | Merge | Default output name, transition gaps on/off, maximum axis speed, whether to skip videos without a funscript, which file extensions count as video |
 | Application | Remember window size, scan on launch, warn before overwriting an existing output, log font size |
+| Audio Sorting | Sort a voice pack into Voice / Category / Intensity folders (a tool, not a setting) |
+| Credits & License | Version, credits (including every voice pack performer), and the full license text |
 
 AV1 gives smaller files. H.264 plays on more devices. Videos are letterboxed to the target
 resolution rather than cropped or stretched.
@@ -150,3 +271,19 @@ dotnet publish -p:PublishProfile=FolderProfile
 ## Feedback
 
 Found a bug or have a request? [Open an issue](https://github.com/attckdog/AttcksMergeTool/issues).
+
+## Credits
+
+Voice clips come from the [OpenNSFW Voice Pack](https://x.com/OpenNSFWSP), used under
+[CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). [CREDITS.md](CREDITS.md) lists every
+performer, along with the pack's attribution rules. If you publish anything made with these
+clips, credit the performers as **VA Pack** with their X handles, for example
+`[Character Moans]: @chiyo1000nights OpenNSFW VoicePack`. Don't use the clips to train AI or
+imitate a performer's voice.
+
+## License
+
+Copyright (C) 2025 attckdog. Licensed under the
+[GNU General Public License v3.0](LICENSE) or (at your option) any later version.
+
+FFmpeg is not bundled. It is installed separately and licensed by the FFmpeg developers.

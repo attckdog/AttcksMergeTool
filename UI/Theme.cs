@@ -34,8 +34,20 @@ internal static class Theme
     /// </summary>
     public static readonly Color MissingValue = Color.FromArgb(235, 95, 95);
 
+    /// <summary>
+    /// Text for a video switched off in the list, across its whole row. The same red as
+    /// <see cref="MissingValue"/>, for the same reason: it is why that video will not be merged.
+    /// </summary>
+    public static readonly Color DisabledText = MissingValue;
+
     /// <summary>De-emphasised text, for the hints under a setting.</summary>
     public static readonly Color MutedText = Color.FromArgb(160, 160, 160);
+
+    /// <summary>
+    /// Hyperlink text. The WinForms default blue is too dark to read against
+    /// <see cref="Window"/>.
+    /// </summary>
+    public static readonly Color Link = Color.FromArgb(110, 170, 255);
 
     /// <summary>The log font at its default size.</summary>
     public static Font LogFont { get; } = LogFontOfSize(DefaultLogFontSize);

@@ -19,4 +19,16 @@
     <None Remove="graphify-out\**" />
   </ItemGroup>
 
+  <!-- Shown in full on the Credits & License page of the Options dialog, so the license
+       travels inside the single-file build rather than beside it. -->
+  <ItemGroup>
+    <EmbeddedResource Include="LICENSE" LogicalName="AttcksMergeTool.LICENSE" />
+  </ItemGroup>
+
+  <!-- The voice pack's terms ask for performer credits wherever the audio goes, so the list
+       sits beside the exe, not inside the single-file bundle. -->
+  <ItemGroup>
+    <None Include="CREDITS.md" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" ExcludeFromSingleFile="true" />
+  </ItemGroup>
+
 </Project>

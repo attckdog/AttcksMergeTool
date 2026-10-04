@@ -21,18 +21,24 @@ public sealed class VideoMerger
     private readonly TrimLookup _trims;
     private readonly IProcessRunner _runner;
     private readonly IMediaProbe _probe;
+    private readonly AudioLibrary _audio;
 
+    /// <param name="audio">
+    /// Where voice clips are drawn from for videos that inject them. Omitted, nothing is injected.
+    /// </param>
     public VideoMerger(
         IJobLogger logger,
         MergeOptions options,
         TrimLookup trims,
         IProcessRunner? runner = null,
-        IMediaProbe? probe = null) {
+        IMediaProbe? probe = null,
+        AudioLibrary? audio = null) {
         _logger = logger;
         _options = options;
         _trims = trims;
         _runner = runner ?? ProcessRunner.Default;
         _probe = probe ?? FFprobe.Default;
+        _audio = audio ?? AudioLibrary.Empty;
     }
 
     /// <param name="scriptResult">
@@ -155,12 +161,19 @@ public sealed class VideoMerger
                     token);
             } else {
                 VideoSegmentSettings? trim = _trims.ForFile(job.SourcePath);
+                bool hasAudio = await _probe.HasAudioAsync(job.SourcePath, token);
 
-                _logger.Log($"Encoding: {Path.GetFileName(job.SourcePath)}");
+                _logger.Log(hasAudio
+                    ? $"Encoding: {Path.GetFileName(job.SourcePath)}"
+                    : $"Encoding: {Path.GetFileName(job.SourcePath)} (no audio track, adding silence)");
+
+                VoiceMix? voice = trim?.Voice is { IsActive: true } injection
+                    ? await RenderVoiceAsync(job.SourcePath, trim, injection, index, token)
+                    : null;
 
                 await _runner.RunAsync(
                     _options.FfmpegPath,
-                    FFmpegArguments.BuildEncode(job.SourcePath, segmentPath, trim, _options),
+                    FFmpegArguments.BuildEncode(job.SourcePath, segmentPath, trim, _options, hasAudio, voice),
                     token);
             }
 
@@ -177,6 +190,92 @@ public sealed class VideoMerger
         });
 
         return segments;
+    }
+
+    /// <summary>
+    /// Picks the voice clips for one scene and renders them to tracks its encode can mix in,
+    /// or returns <c>null</c> when there turns out to be nothing to mix.
+    /// </summary>
+    /// <remarks>
+    /// The tracks go in the temp folder beside the segments, so the cleanup that removes those
+    /// removes these too. Each job seeds its own generator: the encodes run in parallel, and a
+    /// <see cref="Random"/> is not safe to share between them.
+    /// </remarks>
+    private async Task<VoiceMix?> RenderVoiceAsync(
+        string sourcePath,
+        VideoSegmentSettings settings,
+        VoiceInjection injection,
+        int index,
+        CancellationToken cancellationToken) {
+        string name = Path.GetFileName(sourcePath);
+
+        foreach (string missing in _audio.MissingFolders(injection.Folders)) {
+            _logger.Log($"Voice folder not found in the audio library: {missing}", LogLevel.Warning);
+        }
+
+        IReadOnlyList<string> pool = _audio.FilesUnder(injection.Folders);
+
+        if (pool.Count == 0) {
+            _logger.Log($"No voice clips to inject into {name}; its audio is left as it is.", LogLevel.Warning);
+            return null;
+        }
+
+        int? windowMs = await SceneLengthMsAsync(sourcePath, settings, cancellationToken);
+
+        if (windowMs is not > 0) {
+            _logger.Log($"Could not measure {name}, so no voice clips were injected into it.", LogLevel.Warning);
+            return null;
+        }
+
+        IReadOnlyList<VoicePlacement> placements = await VoicePlanner.PlanAsync(
+            pool,
+            windowMs.Value,
+            injection,
+            new Random(Random.Shared.Next()),
+            (path, token) => _audio.GetDurationMsAsync(path, _probe, token),
+            cancellationToken);
+
+        if (placements.Count == 0) {
+            _logger.Log($"No voice clip fits inside {name}; its audio is left as it is.", LogLevel.Warning);
+            return null;
+        }
+
+        _logger.Log($"Voice: {placements.Count} clip{(placements.Count == 1 ? "" : "s")} (from a pool of {pool.Count}) into {name}");
+
+        foreach (VoicePlacement placement in placements) {
+            _logger.Log($"    {placement.StartMs / 1000.0,7:0.0}s  {Path.GetRelativePath(_audio.RootPath, placement.Path)}");
+        }
+
+        var tracks = new List<string>();
+
+        foreach (VoicePlacement[] chunk in placements.Chunk(FFmpegArguments.MaxClipsPerVoiceTrack)) {
+            string trackPath = Path.Combine(_options.TempFolder, $"{index + 1:D4}_voice{tracks.Count + 1}.wav");
+
+            await _runner.RunAsync(
+                _options.FfmpegPath, FFmpegArguments.BuildVoiceTrack(chunk, trackPath, _options), cancellationToken);
+
+            tracks.Add(trackPath);
+        }
+
+        return new VoiceMix(tracks, injection.VoiceVolumePercent, injection.OriginalVolumePercent);
+    }
+
+    /// <summary>
+    /// How long a scene runs once trimmed, which is the time its voice clips have to fit in.
+    /// The same arithmetic the script merge applies, so the two agree on the scene's length.
+    /// </summary>
+    private async Task<int?> SceneLengthMsAsync(
+        string sourcePath,
+        VideoSegmentSettings settings,
+        CancellationToken cancellationToken) {
+        int? durationMs = await _probe.GetDurationMsAsync(sourcePath, cancellationToken);
+
+        if (durationMs is not > 0 || !settings.UseTrim) return durationMs;
+
+        TrimWindow trim = TrimWindow.FromSeconds(settings.StartTime, settings.EndTime);
+        int endMs = trim.EndMs > trim.StartMs ? Math.Min(trim.EndMs, durationMs.Value) : durationMs.Value;
+
+        return Math.Max(0, endMs - trim.StartMs);
     }
 
     /// <summary>One segment to produce.</summary>

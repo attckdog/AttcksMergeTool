@@ -1,12 +1,12 @@
-using System.Text.Json;
+﻿using System.Text.Json;
 
 using AttcksMergeTool.Models;
 
 namespace AttcksMergeTool.Services;
 
 /// <summary>
-/// Reads what the video list displays about a scene: its video's duration and the axes its
-/// funscripts carry.
+/// Reads what the video list displays about a scene: its video's duration and audio, and the
+/// axes its funscripts carry.
 /// </summary>
 /// <remarks>
 /// The axis count mirrors what <see cref="FunscriptMerger"/> would actually emit rather than
@@ -25,11 +25,13 @@ public static class SceneDetailsReader
         IMediaProbe probe,
         CancellationToken cancellationToken = default) {
         int? durationMs = await probe.GetDurationMsAsync(videoPath, cancellationToken);
+        bool hasAudio = await probe.HasAudioAsync(videoPath, cancellationToken);
 
         return new SceneDetails(
             durationMs,
             scene is not null,
-            scene is null ? 0 : await CountAxesAsync(scene, cancellationToken));
+            scene is null ? 0 : await CountAxesAsync(scene, cancellationToken),
+            hasAudio);
     }
 
     /// <summary>
