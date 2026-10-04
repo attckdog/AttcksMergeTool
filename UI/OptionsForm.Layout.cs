@@ -394,6 +394,7 @@ public sealed partial class OptionsForm
             "Voice clips for injected audio come from the OpenNSFW Voice Pack, used under the Creative "
             + "Commons Attribution 4.0 International License. Thank you to every performer below. The "
             + "clips must not be used to train AI or to imitate a performer's voice.");
+        AddStackRow(stack, NewLink("Download the pack: opennsfw.carrd.co", VoicePackCredits.PackSiteUrl));
         AddStackRow(stack, NewLink("Creative Commons Attribution 4.0", VoicePackCredits.PackLicenseUrl));
         AddCreditGroup(stack, "Female VA Pack", VoicePackCredits.Female);
         AddCreditGroup(stack, "Male VA Pack", VoicePackCredits.Male);

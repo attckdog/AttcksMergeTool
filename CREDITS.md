@@ -3,7 +3,7 @@
 ## OpenNSFW Voice Pack
 
 The voice clips used for injected audio come from the **OpenNSFW Voice Pack**
-([@OpenNSFWSP](https://x.com/OpenNSFWSP)), licensed under the
+([@OpenNSFWSP](https://x.com/OpenNSFWSP), <https://opennsfw.carrd.co/>), licensed under the
 [Creative Commons Attribution 4.0 International License](https://creativecommons.org/licenses/by/4.0/).
 The pack was started by Squish Succubus and OpeN. Follow [@WetHotSFX](https://x.com/WetHotSFX)
 to support them.

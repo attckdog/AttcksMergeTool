@@ -20,6 +20,7 @@ public static class VoicePackCredits
     public const string PackName = "OpenNSFW Voice Pack";
     public const string PackHandle = "OpenNSFWSP";
     public const string PackUrl = "https://x.com/OpenNSFWSP";
+    public const string PackSiteUrl = "https://opennsfw.carrd.co/";
     public const string PackLicenseUrl = "https://creativecommons.org/licenses/by/4.0/";
 
     public static IReadOnlyList<VoiceCredit> Female { get; } = [

@@ -97,11 +97,12 @@ folder next to the app.
 
 ### Getting the OpenNSFW voice pack
 
-The [OpenNSFW Voice Pack](https://x.com/OpenNSFWSP) is free, including for commercial work, as
+The [OpenNSFW Voice Pack](https://opennsfw.carrd.co/) is free, including for commercial work, as
 long as you credit the pack and its performers (see [Credits](#credits)).
 
-1. Get the pack from the official sources: [@OpenNSFWSP on X](https://x.com/OpenNSFWSP) or the
-   [OpenNSFW Discord](https://discord.gg/K53FpG4CBF).
+1. Download the pack from [opennsfw.carrd.co](https://opennsfw.carrd.co/). For questions, ask on
+   the [OpenNSFW Discord](https://discord.gg/K53FpG4CBF) or message
+   [@OpenNSFWSP on X](https://x.com/OpenNSFWSP).
 2. Extract it so the `OpenNSFW VA` folder sits inside `Audio`, next to the app:
 
    ```
@@ -274,7 +275,7 @@ Found a bug or have a request? [Open an issue](https://github.com/attckdog/Attck
 
 ## Credits
 
-Voice clips come from the [OpenNSFW Voice Pack](https://x.com/OpenNSFWSP), used under
+Voice clips come from the [OpenNSFW Voice Pack](https://opennsfw.carrd.co/), used under
 [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). [CREDITS.md](CREDITS.md) lists every
 performer, along with the pack's attribution rules. If you publish anything made with these
 clips, credit the performers as **VA Pack** with their X handles, for example
